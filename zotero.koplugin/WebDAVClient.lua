@@ -5,41 +5,44 @@ Zotero's own WebDAV attachment storage (as opposed to the api.zotero.org
 metadata API covered by ZoteroClient.lua) isn't a JSON API: each attachment
 (PDF, EPUB, or any other format KOReader can open — see LibraryCache's
 SUPPORTED_EXTENSIONS) is a plain `{item_key}.zip` file (plus a `.prop`
-sidecar KOReader doesn't need) served over HTTP with Basic Auth. There's
-no Spore spec for that — it's just a GET of a binary blob — so this module
-talks to it
-directly with KOReader's low-level `httpclient`, the same client the Spore
-AsyncHTTP middleware in ZoteroClient.lua uses under the hood, driven by a
-plain coroutine yield/resume instead of Spore's request pipeline.
+sidecar KOReader doesn't need) served over HTTP with Basic Auth.
 
-NOTE on things that need on-device verification (no real KOReader install
-was available to test against while writing this):
-  - `require("mime").b64` (LuaSocket's mime module) is assumed present for
-    Basic Auth header encoding — KOReader bundles LuaSocket for HTTP, and
-    this is the standard companion library for it, but confirm it resolves.
-  - Extraction shells out to the `unzip` binary rather than an FFI zip
-    reader, mirroring scripts/test_sync.sh (already proven against a real
-    WebDAV/zip pair). KOReader ships a `webdav.koplugin` for cloud storage
-    that is a much closer precedent than kosync for this module's HTTP
-    needs — worth diffing against once testing on a real device.
+REWRITTEN after a real on-device error. This used to go through KOReader's
+low-level Turbo-based `httpclient` (the same client Spore's AsyncHTTP
+middleware in ZoteroClient.lua uses), driven by a hand-rolled coroutine.
+On the user's real Kindle, that failed with:
 
-CONFIRMED BUG (found on-device: downloads and "Test connection" both got
-stuck forever on "downloading…"/"Testing…" with no error): every
-coroutine.resume(co, ...) call below used to discard its `ok, err` return
-values. If anything throws inside the coroutine body — before OR after the
-yield — Lua just swallows it: no log line, `callback(...)` never runs, and
-the UI hangs indefinitely with zero indication anything went wrong. Fixed
-by checking `ok, err` on every resume and calling `callback(false, ...)`
-on failure. Also removed the `socketutil:set_timeout`/`reset_timeout`
-calls that used to bracket these requests: verified against the real
-`frontend/httpclient.lua` source that this client is Turbo-based, not
-LuaSocket — `socketutil`'s timeouts never applied to it at all (Turbo
-hardcodes its own connect/request timeouts internally instead). Dead code,
-removed rather than left misleading.
+    WebDAV: failed (internal error: frontend/httpclient.lua:18:
+    attempt to index field 'looper' (a nil value))
+
+i.e. `UIManager.looper` (the Turbo event loop KOReader lazily creates for
+async HTTP) was nil in this context. ZoteroClient.lua's Spore requests
+didn't hit this because its AsyncHTTP middleware guards itself with
+`if not UIManager.looper then return end` and silently falls through to
+Spore's own synchronous transport when the looper isn't there — this file
+called httpclient directly, with no such guard or fallback, so it just
+crashed into that nil index instead.
+
+Fetched and diffed against KOReader's actual, on-device-proven WebDAV
+provider (`plugins/cloudstorage.koplugin/providers/webdav.lua`, via
+`gh api repos/koreader/koreader/contents/...`, not guessed) rather than
+patched around the symptom — that file never touches `httpclient` or
+`UIManager.looper` at all. It downloads over plain, synchronous
+`socket.http` + `ltn12`, with Basic Auth handled by LuaSocket's built-in
+`user`/`password` request fields (no manual `Authorization` header/base64
+needed). This module now follows that exact pattern instead. Synchronous
+means this blocks the UI thread briefly per request — acceptable here
+since every call site is either an explicit user tap (Browse library,
+Test connection) or a background retry, not something that needs to
+interleave with other UI work, and it's the same trade-off KOReader's own
+bundled WebDAV provider already makes for the same kind of request.
 --]]
 
+local http = require("socket.http")
+local ltn12 = require("ltn12")
+local socket = require("socket")
+local socketutil = require("socketutil")
 local logger = require("logger")
-local mime = require("mime")
 
 local WebDAVClient = {}
 
@@ -87,7 +90,8 @@ function WebDAVClient:_extractDocument(zip_path, item_key, dest_dir)
     return final_path, nil
 end
 
---- Download and extract one attachment.
+--- Download and extract one attachment. Synchronous — see file header for
+-- why that's the right trade-off here.
 -- @param webdav_url base WebDAV URL, e.g. "https://host/zotero/"
 -- @param user, password  WebDAV Basic Auth credentials
 -- @param item_key  Zotero attachment item key (the .zip is named {key}.zip)
@@ -97,54 +101,48 @@ function WebDAVClient:download_attachment(webdav_url, user, password, item_key, 
     local base = webdav_url:gsub("/*$", "/")
     local zip_url = base .. item_key .. ".zip"
     local zip_path = dest_dir .. "/." .. item_key .. ".zip.part"
-    local auth_header = "Basic " .. mime.b64(user .. ":" .. password)
 
-    local co
-    co = coroutine.create(function()
-        require("httpclient"):new():request({
-            url = zip_url,
-            method = "GET",
-            on_headers = function(headers)
-                headers:add("authorization", auth_header)
-            end,
-        }, function(res)
-            local ok, err = coroutine.resume(co, res)
-            if not ok then
-                logger.warn("WebDAVClient: download_attachment coroutine error:", err)
-                callback(false, nil, "internal error: " .. tostring(err))
-            end
-        end)
-
-        local res = coroutine.yield()
-
-        if not res or res.code ~= 200 then
-            callback(false, nil, "HTTP " .. tostring(res and res.code or "?") .. " downloading " .. zip_url)
-            return
-        end
-
-        local out_file, open_err = io.open(zip_path, "wb")
-        if not out_file then
-            callback(false, nil, "cannot open " .. zip_path .. " for writing: " .. tostring(open_err))
-            return
-        end
-        out_file:write(res.body or "")
-        out_file:close()
-
-        local doc_path, extract_err = self:_extractDocument(zip_path, item_key, dest_dir)
-        os.remove(zip_path)
-        if not doc_path then
-            callback(false, nil, extract_err)
-            return
-        end
-
-        logger.dbg("WebDAVClient: downloaded", item_key, "->", doc_path)
-        callback(true, doc_path, nil)
-    end)
-    local ok, err = coroutine.resume(co)
-    if not ok then
-        logger.warn("WebDAVClient: download_attachment coroutine error:", err)
-        callback(false, nil, "internal error: " .. tostring(err))
+    local out_file, open_err = io.open(zip_path, "w")
+    if not out_file then
+        callback(false, nil, "cannot open " .. zip_path .. " for writing: " .. tostring(open_err))
+        return
     end
+
+    -- FILE_BLOCK_TIMEOUT/FILE_TOTAL_TIMEOUT: socketutil's own presets for
+    -- "downloading a file, could be large" requests — the same ones
+    -- KOReader's bundled WebDAV cloud-storage provider uses for this
+    -- exact kind of call.
+    socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+    local code, headers, status = socket.skip(1, http.request{
+        url = zip_url,
+        method = "GET",
+        sink = ltn12.sink.file(out_file), -- closes out_file itself once done
+        user = user,
+        password = password,
+    })
+    socketutil:reset_timeout()
+
+    if headers == nil then
+        os.remove(zip_path)
+        logger.warn("WebDAVClient: download_attachment no response:", status or code)
+        callback(false, nil, "no response downloading " .. zip_url .. ": " .. tostring(status or code))
+        return
+    end
+    if code ~= 200 then
+        os.remove(zip_path)
+        callback(false, nil, "HTTP " .. tostring(code) .. " downloading " .. zip_url)
+        return
+    end
+
+    local doc_path, extract_err = self:_extractDocument(zip_path, item_key, dest_dir)
+    os.remove(zip_path)
+    if not doc_path then
+        callback(false, nil, extract_err)
+        return
+    end
+
+    logger.dbg("WebDAVClient: downloaded", item_key, "->", doc_path)
+    callback(true, doc_path, nil)
 end
 
 --- Check that Basic Auth against the WebDAV base URL is accepted, without
@@ -158,40 +156,27 @@ end
 -- @param callback function(ok, detail_string)
 function WebDAVClient:test_connection(webdav_url, user, password, callback)
     local base = webdav_url:gsub("/*$", "/")
-    local auth_header = "Basic " .. mime.b64(user .. ":" .. password)
+    local sink = {} -- body content doesn't matter, only the status code does
 
-    local co
-    co = coroutine.create(function()
-        require("httpclient"):new():request({
-            url = base,
-            method = "GET",
-            on_headers = function(headers)
-                headers:add("authorization", auth_header)
-            end,
-        }, function(res)
-            local ok, err = coroutine.resume(co, res)
-            if not ok then
-                logger.warn("WebDAVClient: test_connection coroutine error:", err)
-                callback(false, "internal error: " .. tostring(err))
-            end
-        end)
+    socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+    local code, headers, status = socket.skip(1, http.request{
+        url = base,
+        method = "GET",
+        sink = ltn12.sink.table(sink),
+        user = user,
+        password = password,
+    })
+    socketutil:reset_timeout()
 
-        local res = coroutine.yield()
-
-        if not res or not res.code then
-            callback(false, "no response from " .. base)
-            return
-        end
-        if res.code == 401 then
-            callback(false, "HTTP 401 — WebDAV username/password rejected")
-        else
-            callback(true, "HTTP " .. res.code)
-        end
-    end)
-    local ok, err = coroutine.resume(co)
-    if not ok then
-        logger.warn("WebDAVClient: test_connection coroutine error:", err)
-        callback(false, "internal error: " .. tostring(err))
+    if headers == nil then
+        logger.warn("WebDAVClient: test_connection no response:", status or code)
+        callback(false, "no response from " .. base .. ": " .. tostring(status or code))
+        return
+    end
+    if code == 401 then
+        callback(false, "HTTP 401 — WebDAV username/password rejected")
+    else
+        callback(true, "HTTP " .. tostring(code))
     end
 end
 

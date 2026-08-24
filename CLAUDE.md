@@ -223,3 +223,27 @@ El usuario pidió explícitamente: que la descarga sea directa (sin el paso inte
 - Panel "Downloads" (`_showDownloadsStatusImpl`): la fila "on device" pasó de `Título [on device]` a `✓ Título`, consistente con Browse library.
 - El glifo `✓` (U+2713) se usa sin más precaución especial que la habitual: la sobre-cautela con el `↻` de la §12 resultó ser una pista falsa (la causa real del crash de esa vez fue el bug de `_`, no el glifo), así que un checkmark estándar UTF-8 no se trata como sospechoso — pero se deja anotado en "Known gaps" del README como no verificado en vivo, igual que el resto de la UI.
 - Verificado con el syntax-checker local tras cada cambio; nada de esta sesión se ha probado aún en el Kindle real.
+
+## 16. Causa raíz real (con captura real) de "Test connection" colgado en WebDAV — `WebDAVClient.lua` reescrito de raíz
+
+El usuario probó el fix de la §15 (los `coroutine.resume` ahora comprueban `ok, err`) y esta vez sí llegó un segundo mensaje — con un error real y legible, capturado en una foto de la pantalla del Kindle:
+
+```
+Zotero API: OK
+WebDAV: failed (internal error: frontend/httpclient.lua:18: attempt
+to index field 'looper' (a nil value))
+```
+
+**Causa raíz confirmada** (esta vez con un mensaje de error real, no por inferencia de código): `UIManager.looper` — el bucle de eventos Turbo que KOReader crea de forma perezosa para HTTP async — es `nil` en este dispositivo/contexto. `WebDAVClient.lua` llamaba a `require("httpclient"):new():request(...)` directamente, sin ningún guard para ese caso. `ZoteroClient.lua` (basado en Spore) no sufre esto porque su middleware `AsyncHTTP` empieza con `if not UIManager.looper then return end` — cuando el looper falta, simplemente no hace nada y Spore cae a su transporte síncrono propio por debajo, que sí funciona (de ahí que "Zotero API: OK" funcionara mientras WebDAV fallaba: las dos rutas solo comparten el nombre del módulo `httpclient`, no el mismo camino de ejecución).
+
+**Decisión de diseño, no solo un parche:** en vez de añadir el mismo guard `if not UIManager.looper then ... end` con algún fallback improvisado, se buscó el precedente real de KOReader para exactamente este caso — WebDAV con Basic Auth — vía `gh api repos/koreader/koreader/contents/...` (no adivinado): `plugins/cloudstorage.koplugin/providers/webdav.lua`, el proveedor de almacenamiento en la nube WebDAV que KOReader trae de fábrica y que miles de usuarios ya usan en producción, muchos con servidores HTTPS. Ese archivo:
+- No toca `httpclient` ni `UIManager.looper` en absoluto — usa `socket.http` (LuaSocket) síncrono + `ltn12` para volcar la respuesta directo a fichero.
+- Usa los campos nativos `user`/`password` de `http.request{}` para Basic Auth — no hace falta construir la cabecera `Authorization` a mano con `mime.b64`.
+- No importa `ssl.https` en ningún sitio, ni bifurca por esquema (`http` vs `https`) — se confirmó cruzando con un segundo módulo real (`plugins/opds.koplugin/opdsbrowser.lua`, que también habla HTTP con servidores reales) que tampoco lo hace, así que `socket.http.request` maneja HTTPS de forma transparente en el LuaSocket que trae KOReader — relevante porque el WebDAV del usuario es `https://zotero.racarla.es/zotero/`.
+- Usa `socketutil.FILE_BLOCK_TIMEOUT`/`FILE_TOTAL_TIMEOUT` (verificados como constantes reales en `frontend/socketutil.lua`, no inventados) — que esta vez sí tienen efecto real, porque `socket.http` (a diferencia de Turbo) sí respeta los timeouts de `socketutil`.
+
+`WebDAVClient.lua` se reescribió completo alrededor de este patrón: sin coroutines, sin `httpclient`, sin `mime`. Las funciones vuelven a ser efectivamente síncronas (bloquean brevemente al hilo de UI mientras dura la petición) — aceptable porque cada punto de entrada es un tap explícito del usuario o un reintento en segundo plano, no algo que necesite convivir con otro trabajo de UI simultáneo; es la misma decisión que ya toma el propio proveedor WebDAV de KOReader para el mismo tipo de petición.
+
+- La firma pública de `download_attachment`/`test_connection` (con `callback`) no cambió, así que `main.lua` no necesitó ningún cambio estructural — solo sigue funcionando, ahora de verdad.
+- Actualizadas las notas obsoletas en README (la de `require("mime").b64` como "known gap" ya no aplica — el módulo entero desapareció del archivo) y reordenados los bullets de "Known gaps" para que el fix más reciente quede primero.
+- Pendiente de confirmar en el dispositivo real: esta es la tercera reescritura de la ruta de descarga WebDAV en esta sesión (coroutine+httpclient con bug de resume → coroutine+httpclient sin bug → síncrono con socket.http) — cada una motivada por evidencia real del dispositivo, no por conjetura preventiva. Si esta también falla, el error en pantalla debería ser suficientemente claro esta vez como para diagnosticarlo sin necesitar `koreader.log`.
