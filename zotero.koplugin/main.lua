@@ -9,16 +9,25 @@ registered for FileManager (is_doc_only = false), not the reader.
 
 Sync is opt-in per item: a full sync always refreshes metadata for the
 whole library (cheap, needed so "Browse library" has something to select
-from), but a document is only downloaded once the user taps it in
-browseItems() to mark it `wanted` — see LibraryCache:setWanted/
-getPendingAttachments. Nothing downloads on its own just because it
-exists in the library. It's also filtered to formats KOReader can
-actually open (LibraryCache's SUPPORTED_EXTENSIONS) — not just PDF.
+from), but a document only downloads once the user taps it in
+browseItems() — that tap fires the download immediately (downloadItemNow),
+no "mark it and wait for the next Sync now" step in between. Nothing
+downloads on its own just because it exists in the library. It's also
+filtered to formats KOReader can actually open (LibraryCache's
+SUPPORTED_EXTENSIONS) — not just PDF.
+
+(LibraryCache:setWanted/getPendingAttachments still exist and are still
+swept up by every sync() — nothing in this file calls setWanted anymore,
+but a library synced with an older version of this plugin may already have
+items marked `wanted` from the old "toggle it, then Sync now downloads it"
+flow, and this sweep lets those finish downloading instead of being
+silently stranded.)
 
 WebDAV is entirely optional and off by default: without it (or with the
 "Enable WebDAV PDF downloads" checkbox in showCredentialsDialog() left
-unchecked), metadata sync and browsing still work, items can still be
-marked wanted, but nothing ever downloads — see isWebDAVConfigured().
+unchecked), metadata sync and browsing still work, but tapping an item to
+download it just explains that WebDAV needs enabling first — see
+isWebDAVConfigured().
 
 NOTE on things that need on-device verification (no real KOReader install
 was available to test against while writing this):
@@ -277,13 +286,26 @@ function Zotero:showCredentialsDialog()
                             end
                         end
 
-                        guard(function()
+                        -- Named (not anonymous) so the NetworkMgr guard
+                        -- below can pass itself as the "call me back once
+                        -- online" continuation.
+                        local runTest
+                        runTest = function()
                             local f = readFields()
                             if f.api_key == "" or f.user_id == "" then
                                 UIManager:show(InfoMessage:new{
                                     text = _("Fill in the Zotero API key and user ID first."),
                                     timeout = 3,
                                 })
+                                return
+                            end
+
+                            -- Without this, tapping "Test connection" while
+                            -- Wi-Fi is asleep (the common case — nothing
+                            -- else in this dialog touches the network first)
+                            -- fires the request into a dead radio and just
+                            -- hangs on "Testing…" forever.
+                            if NetworkMgr:willRerunWhenOnline(guard(runTest)) then
                                 return
                             end
 
@@ -314,7 +336,9 @@ function Zotero:showCredentialsDialog()
                                             .. " (" .. detail .. ")")
                                     end))
                             end))
-                        end)()
+                        end
+
+                        guard(runTest)()
                     end,
                 },
             },
@@ -335,8 +359,10 @@ end
 
 --- Full sync: pull collections + item metadata (incrementally, via the
 -- cached library version) for the *whole* library — that's what "Browse
--- library" has to select from — then download only the documents
--- the user has explicitly marked as wanted there (see browseItems).
+-- library" has to select from. Individual documents mostly download the
+-- moment they're tapped in browseItems() now, not here — this step exists
+-- to sweep up anything still marked `wanted` from before that change (see
+-- the NOTE at the top of this file).
 function Zotero:sync(interactive)
     if not self:isConfigured() then
         if interactive then
@@ -408,16 +434,25 @@ function Zotero:sync(interactive)
     end)
 end
 
---- Download every item marked `wanted` (via "Browse library") that isn't
--- on disk yet, one at a time (sequential on purpose: e-ink WebDAV servers
--- are usually small personal boxes, not something to hammer with parallel
--- requests). Failures are pushed onto ZoteroQueue instead of aborting the
--- batch. `self.active_download_key` tracks which item (if any) is
+--- Sweep-up: download every item still marked `wanted` (a leftover from
+-- before Browse library started downloading on tap — see the NOTE at the
+-- top of this file) that isn't on disk yet, one at a time (sequential on
+-- purpose: e-ink WebDAV servers are usually small personal boxes, not
+-- something to hammer with parallel requests). Failures are pushed onto
+-- ZoteroQueue instead of aborting the batch. `self.active_download_key`
+-- is shared with downloadItemNow() and tracks which item (if any) is
 -- in flight right now, for showDownloadsStatus() to display.
 -- @param done_callback function(downloaded_count, failed_count)
 function Zotero:downloadPendingAttachments(done_callback)
     if not self:isWebDAVConfigured() then
         if done_callback then done_callback(0, 0) end
+        return
+    end
+    -- Kindle's Wi-Fi sleeps aggressively on idle — by the time metadata
+    -- sync finishes and this step starts, it may already be gone even
+    -- though sync() checked at the start. Same NetworkMgr guard sync()
+    -- itself uses.
+    if NetworkMgr:willRerunWhenOnline(function() self:downloadPendingAttachments(done_callback) end) then
         return
     end
 
@@ -466,6 +501,9 @@ end
 -- (silently) and from the menu (interactively).
 function Zotero:drainQueue(interactive)
     if not self:isWebDAVConfigured() then
+        return
+    end
+    if NetworkMgr:willRerunWhenOnline(function() self:drainQueue(interactive) end) then
         return
     end
     ZoteroQueue:drain(function(item, cb)
@@ -557,7 +595,7 @@ function Zotero:_showDownloadsStatusImpl()
     for _key, item in pairs(LibraryCache:load().items) do
         if item.pdf_path then
             table.insert(item_table, {
-                text = (item.title or item.key) .. "  [" .. _("on device") .. "]",
+                text = "✓ " .. (item.title or item.key),
                 zotero_item = item,
             })
         end
@@ -617,16 +655,78 @@ function Zotero:browseCollections()
     UIManager:show(menu)
 end
 
+-- "✓ " prefix marks an item confirmed present on the device (pdf_path set
+-- AND the file still exists — see the on-disk check at each call site).
+-- Plain text otherwise, matching the ellipsis/en-dash already confirmed to
+-- render fine in this UI — this specific glyph itself hasn't been
+-- exercised live yet, though (see Known gaps in README).
 local function itemLabel(item, supported)
-    local label = item.title or item.key
     if not supported then
-        label = label .. "  [" .. _("unsupported format") .. "]"
-    elseif item.pdf_path then
-        label = label .. "  [" .. _("downloaded") .. "]"
-    elseif item.wanted then
-        label = label .. "  [" .. _("queued for sync") .. "]"
+        return (item.title or item.key) .. "  [" .. _("unsupported format") .. "]"
     end
-    return label
+    if item.pdf_path then
+        return "✓ " .. (item.title or item.key)
+    end
+    return item.title or item.key
+end
+
+--- Download one attachment right now (no "mark for later, wait for the
+-- next full sync" indirection — tapping an item in Browse library used to
+-- just toggle a `wanted` flag that the next Sync now would act on; that
+-- extra step was confusing and made failures/hangs hard to see, so a tap
+-- now fires the download immediately and reflects the outcome in place).
+-- `entry`/`menu` are the Browse library row and its Menu widget, so the
+-- row can be updated live; both are optional (nil when called from
+-- elsewhere, e.g. a future non-UI caller) — guarded before use.
+function Zotero:downloadItemNow(item, entry, menu)
+    if not self:isWebDAVConfigured() then
+        UIManager:show(InfoMessage:new{
+            text = _("Enable WebDAV PDF downloads in \"Configure credentials\" first."),
+            timeout = 3,
+        })
+        return
+    end
+    if NetworkMgr:willRerunWhenOnline(function() self:downloadItemNow(item, entry, menu) end) then
+        return
+    end
+
+    local dest_dir = documentDir()
+    self.active_download_key = item.key
+    if entry then
+        entry.text = (item.title or item.key) .. "  [" .. _("downloading…") .. "]"
+        if menu then menu:updateItems() end
+    end
+
+    WebDAVClient:download_attachment(
+        self.settings.webdav_url,
+        self.settings.webdav_user,
+        self.settings.webdav_password,
+        item.key,
+        dest_dir,
+        function(ok, doc_path, err)
+            self.active_download_key = nil
+            if ok then
+                LibraryCache:setPdfPath(item.key, doc_path)
+                LibraryCache:save()
+                item.pdf_path = doc_path
+                UIManager:show(InfoMessage:new{ text = _("Downloaded."), timeout = 2 })
+            else
+                logger.warn("Zotero: failed to download", item.key, err)
+                ZoteroQueue:push{
+                    item_key = item.key,
+                    webdav_url = self.settings.webdav_url,
+                    dest_dir = dest_dir,
+                }
+                UIManager:show(InfoMessage:new{
+                    text = _("Download failed — queued for retry. See \"Downloads\" for details."),
+                    timeout = 4,
+                })
+            end
+            if entry then
+                entry.text = itemLabel(item, true)
+                if menu then menu:updateItems() end
+            end
+        end)
 end
 
 --- Item list for one collection (or the whole library if collection_key
@@ -661,7 +761,7 @@ function Zotero:browseItems(collection_key)
 
     local menu
     menu = Menu:new{
-        title = _("Zotero items — tap to select for sync, or open"),
+        title = _("Zotero items — tap to download, or open"),
         item_table = item_table,
         onMenuSelect = function(_self, entry)
             local item = entry.zotero_item
@@ -677,14 +777,10 @@ function Zotero:browseItems(collection_key)
                 self:openDocument(item.pdf_path)
                 return
             end
-            -- Not downloaded yet: this tap only toggles selection, no
-            -- network activity happens here — "Sync now" is what actually
-            -- downloads whatever ends up marked.
-            local new_wanted = not item.wanted
-            LibraryCache:setWanted(item.key, new_wanted)
-            item.wanted = new_wanted
-            entry.text = itemLabel(item, true)
-            menu:updateItems()
+            -- Not downloaded yet: download it right now, no more
+            -- "mark it and wait for the next Sync now" indirection — see
+            -- downloadItemNow().
+            self:downloadItemNow(item, entry, menu)
         end,
         close_callback = function() UIManager:close(menu) end,
     }

@@ -22,14 +22,24 @@ was available to test against while writing this):
     WebDAV/zip pair). KOReader ships a `webdav.koplugin` for cloud storage
     that is a much closer precedent than kosync for this module's HTTP
     needs — worth diffing against once testing on a real device.
+
+CONFIRMED BUG (found on-device: downloads and "Test connection" both got
+stuck forever on "downloading…"/"Testing…" with no error): every
+coroutine.resume(co, ...) call below used to discard its `ok, err` return
+values. If anything throws inside the coroutine body — before OR after the
+yield — Lua just swallows it: no log line, `callback(...)` never runs, and
+the UI hangs indefinitely with zero indication anything went wrong. Fixed
+by checking `ok, err` on every resume and calling `callback(false, ...)`
+on failure. Also removed the `socketutil:set_timeout`/`reset_timeout`
+calls that used to bracket these requests: verified against the real
+`frontend/httpclient.lua` source that this client is Turbo-based, not
+LuaSocket — `socketutil`'s timeouts never applied to it at all (Turbo
+hardcodes its own connect/request timeouts internally instead). Dead code,
+removed rather than left misleading.
 --]]
 
 local logger = require("logger")
-local socketutil = require("socketutil")
 local mime = require("mime")
-
-local DOWNLOAD_TIMEOUTS = { 15, 60 } -- connect, total — PDFs can be large
-local TEST_TIMEOUTS = { 10, 15 } -- connect, total — should be quick, no body of interest
 
 local WebDAVClient = {}
 
@@ -89,8 +99,6 @@ function WebDAVClient:download_attachment(webdav_url, user, password, item_key, 
     local zip_path = dest_dir .. "/." .. item_key .. ".zip.part"
     local auth_header = "Basic " .. mime.b64(user .. ":" .. password)
 
-    socketutil:set_timeout(DOWNLOAD_TIMEOUTS[1], DOWNLOAD_TIMEOUTS[2])
-
     local co
     co = coroutine.create(function()
         require("httpclient"):new():request({
@@ -100,11 +108,14 @@ function WebDAVClient:download_attachment(webdav_url, user, password, item_key, 
                 headers:add("authorization", auth_header)
             end,
         }, function(res)
-            coroutine.resume(co, res)
+            local ok, err = coroutine.resume(co, res)
+            if not ok then
+                logger.warn("WebDAVClient: download_attachment coroutine error:", err)
+                callback(false, nil, "internal error: " .. tostring(err))
+            end
         end)
 
         local res = coroutine.yield()
-        socketutil:reset_timeout()
 
         if not res or res.code ~= 200 then
             callback(false, nil, "HTTP " .. tostring(res and res.code or "?") .. " downloading " .. zip_url)
@@ -129,7 +140,11 @@ function WebDAVClient:download_attachment(webdav_url, user, password, item_key, 
         logger.dbg("WebDAVClient: downloaded", item_key, "->", doc_path)
         callback(true, doc_path, nil)
     end)
-    coroutine.resume(co)
+    local ok, err = coroutine.resume(co)
+    if not ok then
+        logger.warn("WebDAVClient: download_attachment coroutine error:", err)
+        callback(false, nil, "internal error: " .. tostring(err))
+    end
 end
 
 --- Check that Basic Auth against the WebDAV base URL is accepted, without
@@ -145,8 +160,6 @@ function WebDAVClient:test_connection(webdav_url, user, password, callback)
     local base = webdav_url:gsub("/*$", "/")
     local auth_header = "Basic " .. mime.b64(user .. ":" .. password)
 
-    socketutil:set_timeout(TEST_TIMEOUTS[1], TEST_TIMEOUTS[2])
-
     local co
     co = coroutine.create(function()
         require("httpclient"):new():request({
@@ -156,11 +169,14 @@ function WebDAVClient:test_connection(webdav_url, user, password, callback)
                 headers:add("authorization", auth_header)
             end,
         }, function(res)
-            coroutine.resume(co, res)
+            local ok, err = coroutine.resume(co, res)
+            if not ok then
+                logger.warn("WebDAVClient: test_connection coroutine error:", err)
+                callback(false, "internal error: " .. tostring(err))
+            end
         end)
 
         local res = coroutine.yield()
-        socketutil:reset_timeout()
 
         if not res or not res.code then
             callback(false, "no response from " .. base)
@@ -172,7 +188,11 @@ function WebDAVClient:test_connection(webdav_url, user, password, callback)
             callback(true, "HTTP " .. res.code)
         end
     end)
-    coroutine.resume(co)
+    local ok, err = coroutine.resume(co)
+    if not ok then
+        logger.warn("WebDAVClient: test_connection coroutine error:", err)
+        callback(false, "internal error: " .. tostring(err))
+    end
 end
 
 return WebDAVClient
