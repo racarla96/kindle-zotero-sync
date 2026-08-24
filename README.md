@@ -34,7 +34,7 @@ This is **not** a native GTK2/C app (that route was explored and dropped — see
 1. Jailbreak your Kindle and install KOReader — see [kindlemodding.org](https://kindlemodding.org/) and the [KOReader install guide](https://github.com/koreader/koreader/wiki/Installation-on-Kindle-devices).
 2. Copy `zotero.koplugin/` into KOReader's `plugins/` directory on the device (typically `koreader/plugins/zotero.koplugin/`).
 3. Restart KOReader. A **Zotero** entry should appear in the FileManager's menu.
-4. Open **Zotero → Configure credentials** and fill in your API key, user ID, and WebDAV details (see below).
+4. Open **Zotero → Configure credentials**, fill in your API key, user ID, and WebDAV details (see below), and hit **"Test connection"** to check both against the real Zotero API / WebDAV server without leaving the dialog.
 5. Run **Zotero → Sync now** to pull metadata (nothing downloads yet).
 6. Go to **Zotero → Browse library**, tap the items you actually want on the device to mark them.
 7. If you want attachments to actually download: reopen **Configure credentials**, check **"Enable WebDAV PDF downloads"**, and save — then run **Sync now** again. Check **Zotero → Downloads** any time to see what's downloading, queued, retrying, or already on the device.
@@ -67,14 +67,15 @@ The plugin's error messages are intentionally generic (e-ink, no room for stack 
 1. **Rule out credentials/network first, without touching the Kindle.** Run `scripts/test_sync.sh` (see above) with the *exact same* API key, user ID and WebDAV password you typed into "Configure credentials" on the device. This hits the real Zotero API and your real WebDAV from your computer.
    - If it **fails** here too: it's a credentials or connectivity problem, not a plugin bug — recheck the values (the API key from step 2 above, not your account password; the userID as a plain number; the WebDAV password from Zotero's desktop sync settings).
    - If it **succeeds** here: your credentials are correct, so the device-side failure is either the Kindle's Wi-Fi not actually being connected at sync time, or a bug in `ZoteroClient.lua`/`WebDAVClient.lua`'s async HTTP handling (see [Known gaps](#known-gaps-before-relying-on-this) below) — go to step 2.
-2. **Get the real error from KOReader's log**, over SSH (the jailbreak's Dropbear SSH, if enabled):
-   - In KOReader, enable verbose logging first if you haven't: **gear icon → More tools → Developer options → Enable debug logging**, then reproduce the failure (tap "Sync now" again).
-   - `ssh` into the Kindle and look at `koreader.log` (typically `/mnt/us/koreader/koreader.log` for a KUAL/jailbreak install):
+2. **Get the real error from KOReader's log.** Logs live in KOReader's own install directory, **not** inside `plugins/zotero.koplugin/` — `koreader.log` is the regular running log, `crash.log` is written automatically on an actual crash (both under `/mnt/us/koreader/` for a typical Kindle jailbreak install). Two ways to get at them:
+   - **No SSH needed:** in KOReader, **Menu → Help → Bug Report** packages the logs into a file for easier viewing/sharing.
+   - **Over SSH** (the jailbreak's Dropbear SSH, if enabled): enable verbose logging first if you haven't — **gear icon → More tools → Developer options → Enable debug logging** — then reproduce the failure (tap "Sync now" again), and:
      ```bash
      ssh root@<kindle-ip>
      tail -n 200 /mnt/us/koreader/koreader.log | grep -i zotero
+     cat /mnt/us/koreader/crash.log   # only present if it actually crashed
      ```
-   - Every failure path in this plugin logs before showing the generic UI message (`logger.dbg`/`logger.warn` calls in `ZoteroClient.lua`, `WebDAVClient.lua`, `main.lua`) — that line will say whether it was an HTTP status, a Lua error from a failed `pcall`, or something else entirely.
+   - Every failure path in this plugin logs before showing the generic UI message (`logger.dbg`/`logger.warn` calls in `ZoteroClient.lua`, `WebDAVClient.lua`, `main.lua`) — that line will say whether it was an HTTP status, a Lua error from a failed `pcall`, or something else entirely. A hard crash/freeze (rather than a graceful in-app error message) is what `crash.log` is for specifically.
 3. Paste the relevant log lines somewhere you can compare them against the `NOTE:` comments in the source — most likely culprits are listed in [Known gaps](#known-gaps-before-relying-on-this) below.
 
 ## Known gaps before relying on this
@@ -90,6 +91,7 @@ This was built without a KOReader install or a physical Kindle to test against, 
 - **`SUPPORTED_EXTENSIONS`** in `LibraryCache.lua` is sourced from KOReader's own documented format list (confirmed via its GitHub README), but a few close siblings of the confirmed formats (docx, azw/azw3, cbr/cb7) were added by inference rather than individually confirmed — drop any that don't actually open.
 - **`filemanagerutil.getDefaultDir()`** (used for the download destination) and `Device.home_dir` on Kindle (`/mnt/us`) were verified directly against KOReader's current source rather than assumed, unlike most of the items above — comparatively low risk, but still unverified against a live install's actual `home_dir` setting.
 - **The "Enable WebDAV PDF downloads" checkbox in "Configure credentials"** grafts a `CheckButton` onto the `MultiInputDialog` via `dialog:addWidget()` so it lives alongside the WebDAV fields instead of being a separate menu entry. Both `addWidget()` and `CheckButton` are real, source-verified KOReader APIs, but this specific combination — including whether `parent = dialog` is the right target for a redraw on tap — was never exercised live.
+- **The dialog's "Test connection" button** adds a second `buttons` row (confirmed as a normal, supported case in `inputdialog.lua`'s source — unlike the `separator` field bug above) and calls `ZoteroClient:get_library_version` / `WebDAVClient:test_connection` directly from the dialog. The two client calls themselves reuse already-existing, previously-used code paths, but invoking them from inside this specific dialog's button handling hasn't run on a live device yet.
 - Nothing here has exercised real KOReader event ordering (`onNetworkConnected`, `registerToMainMenu`, etc.) — only Lua syntax was verified (`luaL_loadfile` via a locally-built liblua5.1 checker), not runtime behavior.
 
 ## Licencia

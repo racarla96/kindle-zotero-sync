@@ -29,6 +29,7 @@ local socketutil = require("socketutil")
 local mime = require("mime")
 
 local DOWNLOAD_TIMEOUTS = { 15, 60 } -- connect, total — PDFs can be large
+local TEST_TIMEOUTS = { 10, 15 } -- connect, total — should be quick, no body of interest
 
 local WebDAVClient = {}
 
@@ -127,6 +128,49 @@ function WebDAVClient:download_attachment(webdav_url, user, password, item_key, 
 
         logger.dbg("WebDAVClient: downloaded", item_key, "->", doc_path)
         callback(true, doc_path, nil)
+    end)
+    coroutine.resume(co)
+end
+
+--- Check that Basic Auth against the WebDAV base URL is accepted, without
+-- downloading or assuming any particular file exists there — used by the
+-- "Test connection" button in main.lua's credentials dialog, so the user
+-- can confirm their WebDAV details work without leaving that screen (or
+-- waiting for a full library sync). A GET on the bare base URL is enough:
+-- a 401 means the credentials were rejected; anything else means the
+-- server accepted them and processed the request, whatever it answered
+-- with (a directory listing, a 404 for "no index", ...).
+-- @param callback function(ok, detail_string)
+function WebDAVClient:test_connection(webdav_url, user, password, callback)
+    local base = webdav_url:gsub("/*$", "/")
+    local auth_header = "Basic " .. mime.b64(user .. ":" .. password)
+
+    socketutil:set_timeout(TEST_TIMEOUTS[1], TEST_TIMEOUTS[2])
+
+    local co
+    co = coroutine.create(function()
+        require("httpclient"):new():request({
+            url = base,
+            method = "GET",
+            on_headers = function(headers)
+                headers:add("authorization", auth_header)
+            end,
+        }, function(res)
+            coroutine.resume(co, res)
+        end)
+
+        local res = coroutine.yield()
+        socketutil:reset_timeout()
+
+        if not res or not res.code then
+            callback(false, "no response from " .. base)
+            return
+        end
+        if res.code == 401 then
+            callback(false, "HTTP 401 — WebDAV username/password rejected")
+        else
+            callback(true, "HTTP " .. res.code)
+        end
     end)
     coroutine.resume(co)
 end

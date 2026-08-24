@@ -36,6 +36,15 @@ was available to test against while writing this):
     real (verified against KOReader's source), but this specific
     combination — and whether `parent = dialog` is the right target for
     the checkbox to trigger a redraw on tap — was never exercised live.
+  - The same dialog's "Test connection" button adds a second `buttons`
+    row below Cancel/Save — multi-row `buttons` is a normal, source-
+    confirmed case for this dialog family (unlike the `separator` field
+    that turned out not to exist on `Menu` item rows — see the fixed
+    bug noted in CLAUDE.md), so this one is lower-risk, but it does
+    call `ZoteroClient:get_library_version` and
+    `WebDAVClient:test_connection` from inside the dialog's own event
+    handling, which — like everything else in this file — hasn't run
+    on a live device yet.
 --]]
 
 local DataStorage = require("datastorage")
@@ -182,6 +191,23 @@ function Zotero:showCredentialsDialog()
     local dialog
     local checkbox
 
+    -- Shared by Save and Test connection so both read the fields the same
+    -- way, whether or not the user has hit Save yet.
+    local function readFields()
+        local api_key, user_id, webdav_url, webdav_user, webdav_password =
+            unpack(dialog:getFields())
+        local function trimmed(s) return s and util.trim(s) or "" end
+        return {
+            api_key = trimmed(api_key),
+            user_id = trimmed(user_id),
+            webdav_url = trimmed(webdav_url),
+            webdav_user = trimmed(webdav_user),
+            -- Not trimmed: leading/trailing spaces in a password could be
+            -- intentional (unlikely, but not our call).
+            webdav_password = webdav_password or "",
+        }
+    end
+
     dialog = MultiInputDialog:new{
         title = _("Zotero credentials"),
         fields = {
@@ -202,19 +228,13 @@ function Zotero:showCredentialsDialog()
                     text = _("Save"),
                     is_enter_default = true,
                     callback = function()
-                        local api_key, user_id, webdav_url, webdav_user, webdav_password =
-                            unpack(dialog:getFields())
-                        local function nilIfEmpty(s)
-                            s = s and util.trim(s) or ""
-                            return s ~= "" and s or nil
-                        end
-                        self.settings.api_key = nilIfEmpty(api_key)
-                        self.settings.user_id = nilIfEmpty(user_id)
-                        self.settings.webdav_url = nilIfEmpty(webdav_url)
-                        self.settings.webdav_user = nilIfEmpty(webdav_user)
-                        -- Don't trim the password: leading/trailing spaces
-                        -- could be intentional (unlikely, but not our call).
-                        self.settings.webdav_password = (webdav_password ~= "" and webdav_password) or nil
+                        local f = readFields()
+                        local function nilIfEmpty(s) return s ~= "" and s or nil end
+                        self.settings.api_key = nilIfEmpty(f.api_key)
+                        self.settings.user_id = nilIfEmpty(f.user_id)
+                        self.settings.webdav_url = nilIfEmpty(f.webdav_url)
+                        self.settings.webdav_user = nilIfEmpty(f.webdav_user)
+                        self.settings.webdav_password = nilIfEmpty(f.webdav_password)
                         -- isWebDAVConfigured() still requires the three
                         -- WebDAV fields above regardless of this flag, so
                         -- checking the box with empty fields is harmless
@@ -229,11 +249,54 @@ function Zotero:showCredentialsDialog()
                     end,
                 },
             },
+            {
+                {
+                    text = _("Test connection"),
+                    callback = function()
+                        local f = readFields()
+                        if f.api_key == "" or f.user_id == "" then
+                            UIManager:show(InfoMessage:new{
+                                text = _("Fill in the Zotero API key and user ID first."),
+                                timeout = 3,
+                            })
+                            return
+                        end
+
+                        UIManager:show(InfoMessage:new{ text = _("Testing…"), timeout = 1 })
+
+                        local function showResult(zotero_ok, webdav_line)
+                            local lines = {
+                                zotero_ok and _("Zotero API: OK")
+                                    or _("Zotero API: failed — check the API key and user ID"),
+                            }
+                            if webdav_line then table.insert(lines, webdav_line) end
+                            UIManager:show(InfoMessage:new{
+                                text = table.concat(lines, "\n"),
+                                timeout = 6,
+                            })
+                        end
+
+                        local client = ZoteroClient:new{ service_spec = self.path .. "/api_zotero.json" }
+                        client:get_library_version(f.api_key, f.user_id, function(zotero_ok)
+                            local has_webdav_fields = f.webdav_url ~= "" and f.webdav_user ~= "" and f.webdav_password ~= ""
+                            if not has_webdav_fields then
+                                showResult(zotero_ok, nil)
+                                return
+                            end
+                            WebDAVClient:test_connection(f.webdav_url, f.webdav_user, f.webdav_password,
+                                function(webdav_ok, detail)
+                                    showResult(zotero_ok, (webdav_ok and _("WebDAV: OK") or _("WebDAV: failed"))
+                                        .. " (" .. detail .. ")")
+                                end)
+                        end)
+                    end,
+                },
+            },
         },
     }
 
     checkbox = CheckButton:new{
-        text = _("Enable WebDAV PDF downloads (needs the WebDAV fields above filled in)"),
+        text = _("Enable WebDAV PDF downloads"),
         checked = self.settings.webdav_enabled,
         parent = dialog,
         callback = function() end, -- state is just read from checkbox.checked on Save
