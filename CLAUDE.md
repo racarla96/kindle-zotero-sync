@@ -133,6 +133,16 @@ Nunca commitear `config/config.json` con credenciales reales — solo `config.ex
 - `manifest.json` y `meson.build` de la estructura original (Fase 0-4 del plan GTK2/C descartado) nunca se crearon — el nuevo plan (§2) no los necesita, `zotero.koplugin/` se instala copiando la carpeta directamente a `plugins/`.
 - Directorios vacíos `src/sync/` y `src/ui/` (residuos del plan GTK2/C descartado) eliminados del working tree.
 
+## 10. Sync selectivo por ítem (post-v0.1)
+
+A petición del usuario, la descarga de PDFs dejó de ser automática para toda la biblioteca:
+
+- `LibraryCache` ahora persiste un flag `wanted` por ítem (`LibraryCache:setWanted`), preservado entre syncs de metadata igual que `pdf_path`.
+- `getPendingAttachments()` solo devuelve ítems con `wanted = true` y sin `pdf_path` — nada se descarga sin selección explícita.
+- En "Browse library" (`main.lua:browseItems`), tocar un ítem no descargado alterna su estado `wanted` (`[queued for sync]`) y redibuja la fila con `menu:updateItems()`; tocar uno ya descargado lo abre en el lector.
+- El sync de metadata (`Zotero:sync`) sigue trayendo **toda** la biblioteca (es barato, JSON) — es lo que alimenta el listado para poder seleccionar. Solo la descarga de PDFs quedó gateada por selección.
+- `example/kosync.koplugin/` (la referencia AGPL-3.0) se eliminó del disco tras esta sesión — ya estaba fuera del repo (gitignored) y sus patrones quedaron incorporados en el código/comentarios; no queda ningún archivo AGPL en el entorno de trabajo.
+
 ## 8. Criterios de "hecho" para v0.1
 
 - [ ] Repo en GitHub con `LICENSE` CC BY 4.0.

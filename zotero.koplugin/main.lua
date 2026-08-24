@@ -7,11 +7,19 @@ credentials, NetworkMgr hooks for retrying queued work on reconnect) but
 this plugin is a library browser rather than a per-document sync, so it's
 registered for FileManager (is_doc_only = false), not the reader.
 
+Sync is opt-in per item: a full sync always refreshes metadata for the
+whole library (cheap, needed so "Browse library" has something to select
+from), but a PDF is only downloaded once the user taps it in
+browseItems() to mark it `wanted` — see LibraryCache:setWanted/
+getPendingAttachments. Nothing downloads on its own just because it
+exists in the library.
+
 NOTE on things that need on-device verification (no real KOReader install
 was available to test against while writing this):
   - The `Menu` widget usage below (item_table shape, onMenuSelect
-    signature) follows the common pattern seen across KOReader plugins,
-    but wasn't exercised against a live UIManager.
+    signature, and `menu:updateItems()` to redraw a row's label in place
+    after toggling selection) follows the common pattern seen across
+    KOReader plugins, but wasn't exercised against a live UIManager.
   - `ReaderUI:showReader(path)` is the standard way plugins hand a file
     off to the reader; double-check the exact call against a recent
     KOReader checkout if it doesn't open PDFs as expected.
@@ -183,8 +191,9 @@ function Zotero:showCredentialsDialog()
 end
 
 --- Full sync: pull collections + item metadata (incrementally, via the
--- cached library version), then download any PDF attachments that aren't
--- on disk yet.
+-- cached library version) for the *whole* library — that's what "Browse
+-- library" has to select from — then download only the PDF attachments
+-- the user has explicitly marked as wanted there (see browseItems).
 function Zotero:sync(interactive)
     if not self:isConfigured() then
         if interactive then
@@ -248,10 +257,11 @@ function Zotero:sync(interactive)
     end)
 end
 
---- Download every cached PDF attachment that isn't on disk yet, one at a
--- time (sequential on purpose: e-ink WebDAV servers are usually small
--- personal boxes, not something to hammer with parallel requests).
--- Failures are pushed onto ZoteroQueue instead of aborting the batch.
+--- Download every item marked `wanted` (via "Browse library") that isn't
+-- on disk yet, one at a time (sequential on purpose: e-ink WebDAV servers
+-- are usually small personal boxes, not something to hammer with parallel
+-- requests). Failures are pushed onto ZoteroQueue instead of aborting the
+-- batch.
 -- @param done_callback function(downloaded_count, failed_count)
 function Zotero:downloadPendingAttachments(done_callback)
     if not self:isWebDAVConfigured() then
@@ -360,9 +370,22 @@ function Zotero:browseCollections()
     UIManager:show(menu)
 end
 
+local function itemLabel(item)
+    local label = item.title or item.key
+    if item.pdf_path then
+        label = label .. "  [" .. _("downloaded") .. "]"
+    elseif item.wanted then
+        label = label .. "  [" .. _("queued for sync") .. "]"
+    end
+    return label
+end
+
 --- Item list for one collection (or the whole library if collection_key
--- is nil). Selecting a downloaded item opens it in the reader; selecting
--- one that hasn't synced yet just points the user at "Sync now".
+-- is nil). This is also where the user selects what to sync: tapping an
+-- item that isn't downloaded toggles whether it's queued for the next
+-- "Sync now" (nothing downloads on its own); tapping an already-downloaded
+-- item opens it in the reader instead, since "queue this again" isn't a
+-- useful action once the PDF is already on the device.
 function Zotero:browseItems(collection_key)
     local items = LibraryCache:listItems(collection_key)
     if #items == 0 then
@@ -375,28 +398,28 @@ function Zotero:browseItems(collection_key)
 
     local item_table = {}
     for _, item in ipairs(items) do
-        local label = item.title or item.key
-        if not item.pdf_path then
-            label = label .. "  [" .. _("not downloaded") .. "]"
-        end
-        table.insert(item_table, { text = label, zotero_item = item })
+        table.insert(item_table, { text = itemLabel(item), zotero_item = item })
     end
 
     local menu
     menu = Menu:new{
-        title = _("Zotero items"),
+        title = _("Zotero items — tap to select for sync, or open"),
         item_table = item_table,
         onMenuSelect = function(_self, entry)
             local item = entry.zotero_item
             if item.pdf_path and lfs.attributes(item.pdf_path, "mode") then
                 UIManager:close(menu)
                 self:openPdf(item.pdf_path)
-            else
-                UIManager:show(InfoMessage:new{
-                    text = _("This PDF hasn't been downloaded yet. Run \"Sync now\" first."),
-                    timeout = 3,
-                })
+                return
             end
+            -- Not downloaded yet: this tap only toggles selection, no
+            -- network activity happens here — "Sync now" is what actually
+            -- downloads whatever ends up marked.
+            local new_wanted = not item.wanted
+            LibraryCache:setWanted(item.key, new_wanted)
+            item.wanted = new_wanted
+            entry.text = itemLabel(item)
+            menu:updateItems()
         end,
         close_callback = function() UIManager:close(menu) end,
     }

@@ -20,7 +20,7 @@ local LibraryCache = {}
 local function default_state()
     return {
         library_version = 0,
-        items = {},       -- item_key -> { key, title, creators, collection_keys, tags, version, content_type, link_mode, parent_item, pdf_path }
+        items = {},       -- item_key -> { key, title, creators, collection_keys, tags, version, content_type, link_mode, parent_item, pdf_path, wanted }
         collections = {}, -- collection_key -> { key, name, parent_collection }
     }
 end
@@ -69,7 +69,9 @@ end
 --- Merge a batch of raw Zotero API item objects (each with `.key` and
 -- `.data`, as returned by ZoteroClient:list_items) into the cache.
 -- Items the API reports as deleted are dropped from the cache; a
--- previously-downloaded pdf_path is preserved across metadata-only merges.
+-- previously-downloaded pdf_path, and whether the user marked the item as
+-- wanted (see setWanted), are preserved across metadata-only merges — a
+-- metadata sync must never silently unmark or re-queue anything.
 function LibraryCache:mergeItems(api_items)
     local state = self:load()
     for _, api_item in ipairs(api_items) do
@@ -90,6 +92,7 @@ function LibraryCache:mergeItems(api_items)
                 link_mode = data.linkMode or (existing and existing.link_mode),
                 parent_item = data.parentItem or (existing and existing.parent_item),
                 pdf_path = existing and existing.pdf_path,
+                wanted = existing and existing.wanted,
             }
         end
     end
@@ -115,6 +118,19 @@ function LibraryCache:setPdfPath(item_key, pdf_path)
     end
 end
 
+--- Mark (or unmark) an item as selected for download. Saved immediately
+-- rather than waiting for the caller's next save() — this is a direct,
+-- explicit user action from the "Browse library" UI (a tap), not part of
+-- a larger sync transaction, so it shouldn't be lost if something goes
+-- wrong before the next unrelated save happens to fire.
+function LibraryCache:setWanted(item_key, wanted)
+    local state = self:load()
+    if state.items[item_key] then
+        state.items[item_key].wanted = wanted or nil
+        self:save()
+    end
+end
+
 function LibraryCache:getItem(item_key)
     return self:load().items[item_key]
 end
@@ -124,12 +140,14 @@ local function is_pdf_attachment(item)
         and (item.link_mode == "imported_file" or item.link_mode == "imported_url")
 end
 
---- @return array of item entries that are PDF attachments not yet downloaded.
+--- @return array of item entries that are PDF attachments the user marked
+-- as wanted (via the "Browse library" toggle) and that aren't downloaded
+-- yet. Nothing downloads until the user has explicitly selected it.
 function LibraryCache:getPendingAttachments()
     local state = self:load()
     local pending = {}
     for _, item in pairs(state.items) do
-        if is_pdf_attachment(item) and not item.pdf_path then
+        if is_pdf_attachment(item) and item.wanted and not item.pdf_path then
             table.insert(pending, item)
         end
     end
