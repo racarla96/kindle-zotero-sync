@@ -124,31 +124,28 @@ zotero-koplugin/
 
 Nunca commitear `config/config.json` con credenciales reales — solo `config.example.json`. Añadir `config/config.json` a `.gitignore`. Dentro del plugin instalado, las credenciales viven en `LuaSettings` (mismo mecanismo que `kosync.settings_file`), no en este archivo — el `config.json` es solo para el script de prueba de la Fase 0.
 
-## 9. Notas de progreso
+## 8. Criterios de "hecho" para v0.1
+
+- [x] Repo en GitHub con `LICENSE` CC BY 4.0.
+- [x] Ningún archivo de `kosync.koplugin` (AGPL-3.0) commiteado al repo.
+- [x] `test_sync.sh` descarga al menos un PDF real desde el WebDAV del usuario. — verificado 2026-08-24 contra la cuenta real del usuario (userID 9440868): API de Zotero, WebDAV y extracción de PDF funcionan de punta a punta.
+- [x] `zotero.koplugin` carga en KOReader sin errores (aparece en el menú). — confirmado en Kindle real: aparecen "Sincronizar ahora", "Browse library", "Configure credentials", "Retry queue (empty)".
+- [ ] Sync incremental funciona (segunda ejecución no vuelve a pedir toda la biblioteca). — bloqueado por el bug de abajo.
+- [ ] Descarga de PDF con fallo de red se encola y se reintenta al reconectar wifi.
+- [ ] Un ítem de la biblioteca se puede abrir desde el menú del plugin y KOReader lo renderiza.
+
+## 9. Bug conocido: "Could not reach the Zotero API" en dispositivo real
+
+Detectado 2026-08-24 en un Kindle real, con credenciales confirmadas correctas (ver checklist arriba: `test_sync.sh` funciona con las mismas credenciales). El menú del plugin se registra y renderiza bien, pero "Sincronizar ahora" falla en la llamada a `ZoteroClient:list_items` — el mensaje en pantalla es el genérico de `main.lua`, la causa real solo queda en `koreader.log` (`logger.dbg`/`logger.warn` en `ZoteroClient.lua`). Diagnóstico documentado en el README (§ Troubleshooting) — pendiente: obtener el log real vía SSH al dispositivo y contrastarlo contra los puntos de la sección "Known gaps" (candidatos más probables: middleware `AsyncHTTP`/Spore, casing del header, o algo en la ruta `self.path .. "/api_zotero.json"`).
+
+## 10. Notas de progreso
 
 - **Fases 0-6 completadas** en una sola sesión (a petición explícita del usuario): repo actualizado, `.gitignore` protegiendo `example/` (verificado con `git check-ignore`), `zotero.koplugin/` completo (`api_zotero.json`, `ZoteroClient.lua`, `WebDAVClient.lua`, `ZoteroQueue.lua`, `LibraryCache.lua`, `main.lua`, `_meta.lua`), y `README.md` reescrito para la nueva arquitectura.
-- **Verificación realizada:** los 6 archivos `.lua` pasan un chequeo de sintaxis (`luaL_loadfile` contra un `liblua5.1` compilado localmente con un wrapper C mínimo, ver historial de la sesión). **No** se ejecutó nada contra un KOReader real ni un Kindle físico — no había ninguno disponible en el entorno de generación.
-- **Puntos marcados como "verificar en dispositivo"** (con comentarios `NOTE:` en el código y listados en el README bajo "Known gaps"): forma exacta del widget `Menu` (item_table/`onMenuSelect`) en `main.lua`; llamada `ReaderUI:showReader(path)`; casing del header `Last-Modified-Version` en `ZoteroClient.lua`; disponibilidad de `require("mime").b64` en `WebDAVClient.lua`. KOReader trae un `webdav.koplugin` propio (cloud storage) que es un precedente más cercano que `kosync.koplugin` para las necesidades HTTP de `WebDAVClient.lua` — vale la pena comparar contra él al probar en el dispositivo.
+- **Verificación realizada:** los 6 archivos `.lua` pasan un chequeo de sintaxis (`luaL_loadfile` contra un `liblua5.1` compilado localmente con un wrapper C mínimo, ver historial de la sesión). Posteriormente se validó `test_sync.sh` contra la cuenta real del usuario (ver checklist arriba) y se probó el plugin en un Kindle real (ver §9).
+- **Puntos marcados como "verificar en dispositivo"** (con comentarios `NOTE:` en el código y listados en el README bajo "Known gaps"): forma exacta del widget `Menu` (item_table/`onMenuSelect`/`menu:updateItems()`) en `main.lua`; llamada `ReaderUI:showReader(path)`; casing del header `Last-Modified-Version` en `ZoteroClient.lua`; disponibilidad de `require("mime").b64` en `WebDAVClient.lua`. KOReader trae un `webdav.koplugin` propio (cloud storage) que es un precedente más cercano que `kosync.koplugin` para las necesidades HTTP de `WebDAVClient.lua` — vale la pena comparar contra él al probar en el dispositivo.
 - **Desviación deliberada del brief:** `ZoteroQueue:drain()` (Fase 4, tarea 11) no es "casi literal" a `KOSyncQueue:drain()` — se cambió de una firma síncrona (`send_func(item) -> bool`) a callback-based (`download_func(item, cb)`), porque `WebDAVClient` es intrínsecamente asíncrono (coroutine + `httpclient`/Turbo) y envolverlo en una espera síncrona habría requerido una API de "pump" del UIManager no verificada. `main.lua` y `WebDAVClient.lua` están escritos alrededor de esta versión async de `drain()`.
 - `manifest.json` y `meson.build` de la estructura original (Fase 0-4 del plan GTK2/C descartado) nunca se crearon — el nuevo plan (§2) no los necesita, `zotero.koplugin/` se instala copiando la carpeta directamente a `plugins/`.
 - Directorios vacíos `src/sync/` y `src/ui/` (residuos del plan GTK2/C descartado) eliminados del working tree.
-
-## 10. Sync selectivo por ítem (post-v0.1)
-
-A petición del usuario, la descarga de PDFs dejó de ser automática para toda la biblioteca:
-
-- `LibraryCache` ahora persiste un flag `wanted` por ítem (`LibraryCache:setWanted`), preservado entre syncs de metadata igual que `pdf_path`.
-- `getPendingAttachments()` solo devuelve ítems con `wanted = true` y sin `pdf_path` — nada se descarga sin selección explícita.
-- En "Browse library" (`main.lua:browseItems`), tocar un ítem no descargado alterna su estado `wanted` (`[queued for sync]`) y redibuja la fila con `menu:updateItems()`; tocar uno ya descargado lo abre en el lector.
-- El sync de metadata (`Zotero:sync`) sigue trayendo **toda** la biblioteca (es barato, JSON) — es lo que alimenta el listado para poder seleccionar. Solo la descarga de PDFs quedó gateada por selección.
-- `example/kosync.koplugin/` (la referencia AGPL-3.0) se eliminó del disco tras esta sesión — ya estaba fuera del repo (gitignored) y sus patrones quedaron incorporados en el código/comentarios; no queda ningún archivo AGPL en el entorno de trabajo.
-
-## 8. Criterios de "hecho" para v0.1
-
-- [ ] Repo en GitHub con `LICENSE` CC BY 4.0.
-- [ ] Ningún archivo de `kosync.koplugin` (AGPL-3.0) commiteado al repo.
-- [ ] `test_sync.sh` descarga al menos un PDF real desde el WebDAV del usuario.
-- [ ] `zotero.koplugin` carga en KOReader sin errores (aparece en el menú).
-- [ ] Sync incremental funciona (segunda ejecución no vuelve a pedir toda la biblioteca).
-- [ ] Descarga de PDF con fallo de red se encola y se reintenta al reconectar wifi.
-- [ ] Un ítem de la biblioteca se puede abrir desde el menú del plugin y KOReader lo renderiza.
+- Sync selectivo por ítem (post-v0.1, a petición del usuario): `LibraryCache` persiste un flag `wanted` por ítem (`LibraryCache:setWanted`), preservado entre syncs de metadata igual que `pdf_path`. `getPendingAttachments()` solo devuelve ítems con `wanted = true` y sin `pdf_path` — nada se descarga sin selección explícita. En "Browse library" (`main.lua:browseItems`), tocar un ítem no descargado alterna su estado `wanted` (`[queued for sync]`) y redibuja la fila con `menu:updateItems()`; tocar uno ya descargado lo abre en el lector. El sync de metadata sigue trayendo toda la biblioteca (es barato, JSON) — solo la descarga de PDFs quedó gateada por selección.
+- `example/kosync.koplugin/` (la referencia AGPL-3.0) se eliminó del disco tras la sesión del pivote a KOReader — ya estaba fuera del repo (gitignored) y sus patrones quedaron incorporados en el código/comentarios; no queda ningún archivo AGPL en el entorno de trabajo.
+- El README ganó una sección "Troubleshooting" con el flujo de diagnóstico validado en esta sesión: primero `test_sync.sh` en el PC (descarta credenciales), luego log de KOReader vía SSH (`koreader.log`, requiere activar "Enable debug logging" en Developer options) si el fallo persiste solo en el dispositivo. También se corrigieron las instrucciones de la API key: el enlace directo y fiable es `zotero.org/settings/keys`, no siempre aparece una sección "Applications" bajo Settings → Security.

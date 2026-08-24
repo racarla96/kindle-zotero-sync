@@ -15,7 +15,8 @@ This is **not** a native GTK2/C app (that route was explored and dropped — see
 - ✅ **Fase 4** — [`zotero.koplugin/ZoteroQueue.lua`](./zotero.koplugin/ZoteroQueue.lua): retry queue for failed downloads, drained on reconnect.
 - ✅ **Fase 5** — [`zotero.koplugin/LibraryCache.lua`](./zotero.koplugin/LibraryCache.lua): local cache of items/collections + last synced library version (incremental sync).
 - ✅ **Fase 6** — [`zotero.koplugin/main.lua`](./zotero.koplugin/main.lua): FileManager menu, credentials dialog, sync orchestration, collection/item browser.
-- ⚠️ **Untested on a real device.** All of the above was written and syntax-checked (`luaL_loadfile` against liblua5.1) without access to a physical Kindle or a KOReader install — see [Known gaps](#known-gaps-before-relying-on-this) below before trusting it with your library.
+- ✅ **`scripts/test_sync.sh` validated against a real Zotero account + WebDAV** — confirms the API key/user ID/WebDAV credential flow (see [Getting your Zotero API key](#getting-your-zotero-api-key-and-user-id) below) actually works end-to-end.
+- ⚠️ **Plugin itself untested on a real device.** All of `zotero.koplugin/` was written and syntax-checked (`luaL_loadfile` against liblua5.1) without access to a physical Kindle or a KOReader install; first real on-device run hit `Could not reach the Zotero API` even with confirmed-good credentials — see [Troubleshooting](#troubleshooting-could-not-reach-the-zotero-api-or-similar-errors-on-device) and [Known gaps](#known-gaps-before-relying-on-this) below.
 
 ## How it works
 
@@ -36,12 +37,12 @@ This is **not** a native GTK2/C app (that route was explored and dropped — see
 
 ## Getting your Zotero API key and user ID
 
-1. Log into [zotero.org](https://www.zotero.org/) and go to **Settings → Security** ([zotero.org/settings/security](https://www.zotero.org/settings/security)).
-2. Under **Applications**, click **Create new private key**. Give it a name (e.g. "kindle-sync") and grant at least **Allow library access** (read-only is enough).
-3. Copy the generated key — Zotero only shows it once.
-4. On the same page, your **userID for use in API calls** is shown near the top; copy that number too.
+1. Log into [zotero.org](https://www.zotero.org/), then go straight to **[zotero.org/settings/keys](https://www.zotero.org/settings/keys)** — this is the reliable direct link. (Zotero's settings navigation has changed over time; if you go through **Settings → Security** instead and don't see an "Applications" section there, use the direct `/settings/keys` link above rather than hunting for it.)
+2. Click **Create new private key**. Give it a name (e.g. "kindle-sync") and grant at least **Allow library access** (read-only is enough — the plugin never writes to your library).
+3. Copy the generated key — Zotero only shows it once. This is what goes in `zotero_api_key` / the plugin's "Configure credentials" dialog. It is **not** your account password.
+4. Your **userID for use in API calls** is shown near the top of the same page; copy that number into `zotero_user_id`.
 
-WebDAV credentials are the same ones configured in Zotero's own **Settings → Sync → File Syncing → WebDAV** — this plugin reads from that same server, it doesn't set it up for you.
+WebDAV credentials are the same ones configured in Zotero's own **Settings → Sync → File Syncing → WebDAV** (in the Zotero desktop app, not the website) — this plugin reads from that same server, it doesn't set it up for you.
 
 ## Testing the sync flow without the plugin
 
@@ -54,6 +55,23 @@ cp config/config.example.json config/config.json
 ```
 
 `config/config.json` is only used by this test script and is gitignored. The plugin itself stores credentials separately, in KOReader's own `LuaSettings` (`{DataStorage}/settings/zotero.lua`), set via the in-app "Configure credentials" dialog.
+
+## Troubleshooting "Could not reach the Zotero API" (or similar errors) on-device
+
+The plugin's error messages are intentionally generic (e-ink, no room for stack traces) — the real cause is only in KOReader's own log. Work through this in order rather than guessing:
+
+1. **Rule out credentials/network first, without touching the Kindle.** Run `scripts/test_sync.sh` (see above) with the *exact same* API key, user ID and WebDAV password you typed into "Configure credentials" on the device. This hits the real Zotero API and your real WebDAV from your computer.
+   - If it **fails** here too: it's a credentials or connectivity problem, not a plugin bug — recheck the values (the API key from step 2 above, not your account password; the userID as a plain number; the WebDAV password from Zotero's desktop sync settings).
+   - If it **succeeds** here: your credentials are correct, so the device-side failure is either the Kindle's Wi-Fi not actually being connected at sync time, or a bug in `ZoteroClient.lua`/`WebDAVClient.lua`'s async HTTP handling (see [Known gaps](#known-gaps-before-relying-on-this) below) — go to step 2.
+2. **Get the real error from KOReader's log**, over SSH (the jailbreak's Dropbear SSH, if enabled):
+   - In KOReader, enable verbose logging first if you haven't: **gear icon → More tools → Developer options → Enable debug logging**, then reproduce the failure (tap "Sync now" again).
+   - `ssh` into the Kindle and look at `koreader.log` (typically `/mnt/us/koreader/koreader.log` for a KUAL/jailbreak install):
+     ```bash
+     ssh root@<kindle-ip>
+     tail -n 200 /mnt/us/koreader/koreader.log | grep -i zotero
+     ```
+   - Every failure path in this plugin logs before showing the generic UI message (`logger.dbg`/`logger.warn` calls in `ZoteroClient.lua`, `WebDAVClient.lua`, `main.lua`) — that line will say whether it was an HTTP status, a Lua error from a failed `pcall`, or something else entirely.
+3. Paste the relevant log lines somewhere you can compare them against the `NOTE:` comments in the source — most likely culprits are listed in [Known gaps](#known-gaps-before-relying-on-this) below.
 
 ## Known gaps before relying on this
 
