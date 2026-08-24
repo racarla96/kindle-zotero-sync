@@ -23,7 +23,8 @@ downloads — see isWebDAVConfigured().
 NOTE on things that need on-device verification (no real KOReader install
 was available to test against while writing this):
   - The `Menu` widget usage below (item_table shape, onMenuSelect
-    signature, and `menu:updateItems()` to redraw a row's label in place
+    signature, `dim = true` to render an unsupported-format row as
+    disabled, and `menu:updateItems()` to redraw a row's label in place
     after toggling selection) follows the common pattern seen across
     KOReader plugins, but wasn't exercised against a live UIManager.
   - `ReaderUI:showReader(path)` is the standard way plugins hand a file
@@ -493,9 +494,11 @@ function Zotero:browseCollections()
     UIManager:show(menu)
 end
 
-local function itemLabel(item)
+local function itemLabel(item, supported)
     local label = item.title or item.key
-    if item.pdf_path then
+    if not supported then
+        label = label .. "  [" .. _("unsupported format") .. "]"
+    elseif item.pdf_path then
         label = label .. "  [" .. _("downloaded") .. "]"
     elseif item.wanted then
         label = label .. "  [" .. _("queued for sync") .. "]"
@@ -508,7 +511,10 @@ end
 -- item that isn't downloaded toggles whether it's queued for the next
 -- "Sync now" (nothing downloads on its own); tapping an already-downloaded
 -- item opens it in the reader instead, since "queue this again" isn't a
--- useful action once it's already on the device.
+-- useful action once it's already on the device. Attachments in a format
+-- KOReader can't open are still listed — so the user can see they exist
+-- — but rendered dimmed/disabled (`[unsupported format]`) and tapping
+-- one just explains why instead of toggling selection.
 function Zotero:browseItems(collection_key)
     local items = LibraryCache:listItems(collection_key)
     if #items == 0 then
@@ -521,7 +527,13 @@ function Zotero:browseItems(collection_key)
 
     local item_table = {}
     for _, item in ipairs(items) do
-        table.insert(item_table, { text = itemLabel(item), zotero_item = item })
+        local supported = LibraryCache:isSupportedFormat(item)
+        table.insert(item_table, {
+            text = itemLabel(item, supported),
+            zotero_item = item,
+            zotero_supported = supported,
+            dim = not supported,
+        })
     end
 
     local menu
@@ -530,6 +542,13 @@ function Zotero:browseItems(collection_key)
         item_table = item_table,
         onMenuSelect = function(_self, entry)
             local item = entry.zotero_item
+            if not entry.zotero_supported then
+                UIManager:show(InfoMessage:new{
+                    text = _("This attachment's format isn't one KOReader can open, so it can't be synced."),
+                    timeout = 3,
+                })
+                return
+            end
             if item.pdf_path and lfs.attributes(item.pdf_path, "mode") then
                 UIManager:close(menu)
                 self:openDocument(item.pdf_path)
@@ -541,7 +560,7 @@ function Zotero:browseItems(collection_key)
             local new_wanted = not item.wanted
             LibraryCache:setWanted(item.key, new_wanted)
             item.wanted = new_wanted
-            entry.text = itemLabel(item)
+            entry.text = itemLabel(item, true)
             menu:updateItems()
         end,
         close_callback = function() UIManager:close(menu) end,

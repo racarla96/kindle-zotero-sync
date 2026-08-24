@@ -169,16 +169,22 @@ function LibraryCache:getItem(item_key)
     return self:load().items[item_key]
 end
 
---- Is this item a downloadable attachment (imported file, not a link-only
--- item) in a format KOReader can open? Checked against the attachment's
--- `filename` extension first (Zotero's own `contentType` is unreliable
--- for many formats, often just "application/octet-stream"); falls back
--- to contentType == "application/pdf" for older cache entries synced
--- before `filename` was tracked here, or if Zotero reports no filename.
-local function is_koreader_document(item)
-    if item.link_mode ~= "imported_file" and item.link_mode ~= "imported_url" then
-        return false
-    end
+--- Is this item an imported-file/imported-url attachment at all (as
+-- opposed to a link-only item, a note, a top-level parent item without
+-- its own file, etc.)? This is the "does it belong in Browse library at
+-- all" check — format compatibility is separate (see isSupportedFormat)
+-- so an unsupported-format attachment can still be *shown*, just not
+-- downloaded.
+local function is_attachment(item)
+    return item.link_mode == "imported_file" or item.link_mode == "imported_url"
+end
+
+--- Is this attachment in a format KOReader can open? Checked against the
+-- attachment's `filename` extension first (Zotero's own `contentType` is
+-- unreliable for many formats, often just "application/octet-stream");
+-- falls back to contentType == "application/pdf" for older cache entries
+-- synced before `filename` was tracked here, or if Zotero reports none.
+local function is_supported_format(item)
     local ext = file_extension(item.filename)
     if ext then
         return SUPPORTED_EXTENSIONS[ext:lower()] == true
@@ -186,9 +192,23 @@ local function is_koreader_document(item)
     return item.content_type == "application/pdf"
 end
 
+local function is_koreader_document(item)
+    return is_attachment(item) and is_supported_format(item)
+end
+
+--- Public wrapper for is_supported_format — main.lua uses this to decide
+-- whether to render a Browse library row as disabled ("unsupported
+-- format") rather than filtering it out of the list entirely.
+function LibraryCache:isSupportedFormat(item)
+    return is_supported_format(item)
+end
+
 --- @return array of item entries that are KOReader-openable attachments
 -- the user marked as wanted (via the "Browse library" toggle) and that
--- aren't downloaded yet. Nothing downloads until explicitly selected.
+-- aren't downloaded yet. Nothing downloads until explicitly selected —
+-- and an unsupported-format attachment can never end up here even if
+-- `wanted` somehow got set on it (browseItems() doesn't let it be set
+-- in the first place, but this is the actual enforcement point).
 function LibraryCache:getPendingAttachments()
     local state = self:load()
     local pending = {}
@@ -212,13 +232,16 @@ function LibraryCache:listCollections()
 end
 
 --- @param collection_key string|nil: restrict to one collection, or list
---        every KOReader-openable item in the library if nil.
+--        every attachment in the library if nil. Includes attachments in
+--        formats KOReader can't open — the caller (browseItems()) renders
+--        those disabled rather than hiding them, so the user can see they
+--        exist without being able to select them for download.
 -- @return array of item entries, sorted by title.
 function LibraryCache:listItems(collection_key)
     local state = self:load()
     local list = {}
     for _, item in pairs(state.items) do
-        if is_koreader_document(item) then
+        if is_attachment(item) then
             local matches = not collection_key
             if collection_key and item.collection_keys then
                 for _, ck in ipairs(item.collection_keys) do
