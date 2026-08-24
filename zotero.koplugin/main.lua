@@ -54,6 +54,13 @@ was available to test against while writing this):
     `WebDAVClient:test_connection` from inside the dialog's own event
     handling, which — like everything else in this file — hasn't run
     on a live device yet.
+  - downloadItemNow()'s progress bar (`ProgressbarDialog` +
+    `WebDAVClient:get_attachment_size`'s HEAD request for `progress_max`)
+    mirrors KOReader's own `cloudstorage.koplugin`/`cloudstorage.lua`
+    pattern line-for-line (including the `scheduleIn(1, ...)` delay before
+    the blocking download call, so the dialog actually gets to paint
+    first) — real, source-verified widget and pattern, but this specific
+    call site hasn't run live yet.
 --]]
 
 local DataStorage = require("datastorage")
@@ -62,6 +69,7 @@ local LuaSettings = require("luasettings")
 local Menu = require("ui/widget/menu")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
 local NetworkMgr = require("ui/network/manager")
+local ProgressbarDialog = require("ui/widget/progressbardialog")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local filemanagerutil = require("apps/filemanager/filemanagerutil")
@@ -697,36 +705,65 @@ function Zotero:downloadItemNow(item, entry, menu)
         if menu then menu:updateItems() end
     end
 
-    WebDAVClient:download_attachment(
-        self.settings.webdav_url,
-        self.settings.webdav_user,
-        self.settings.webdav_password,
-        item.key,
-        dest_dir,
-        function(ok, doc_path, err)
-            self.active_download_key = nil
-            if ok then
-                LibraryCache:setPdfPath(item.key, doc_path)
-                LibraryCache:save()
-                item.pdf_path = doc_path
-                UIManager:show(InfoMessage:new{ text = _("Downloaded."), timeout = 2 })
-            else
-                logger.warn("Zotero: failed to download", item.key, err)
-                ZoteroQueue:push{
-                    item_key = item.key,
-                    webdav_url = self.settings.webdav_url,
-                    dest_dir = dest_dir,
-                }
-                UIManager:show(InfoMessage:new{
-                    text = _("Download failed — queued for retry. See \"Downloads\" for details."),
-                    timeout = 4,
-                })
-            end
-            if entry then
-                entry.text = itemLabel(item, true)
-                if menu then menu:updateItems() end
-            end
-        end)
+    -- Progress bar: same pattern as KOReader's own bundled WebDAV
+    -- cloud-storage provider (plugins/cloudstorage.koplugin/cloudstorage.lua)
+    -- — ProgressbarDialog sized with a HEAD-request byte count up front
+    -- (get_attachment_size), then socketutil.chainSinkWithProgressCallback
+    -- drives progress_dialog:reportProgress() as the GET streams in.
+    -- get_attachment_size can return nil (server didn't send
+    -- Content-Length on HEAD) — ProgressbarDialog itself already handles
+    -- a nil progress_max by just hiding the bar, so nothing extra needed
+    -- here for that case.
+    local size = WebDAVClient:get_attachment_size(
+        self.settings.webdav_url, self.settings.webdav_user, self.settings.webdav_password, item.key)
+    local progress_dialog = ProgressbarDialog:new{
+        title = _("Downloading…"),
+        subtitle = item.title or item.key,
+        progress_max = size,
+    }
+    UIManager:show(progress_dialog)
+
+    -- scheduleIn(1, ...): the actual download below is a synchronous,
+    -- blocking call (see WebDAVClient.lua) — without this, it would start
+    -- running before UIManager gets a chance to actually paint the dialog
+    -- just shown above. Same delay KOReader's own cloudstorage.lua uses
+    -- for exactly this reason.
+    UIManager:scheduleIn(1, function()
+        WebDAVClient:download_attachment(
+            self.settings.webdav_url,
+            self.settings.webdav_user,
+            self.settings.webdav_password,
+            item.key,
+            dest_dir,
+            function(ok, doc_path, err)
+                UIManager:close(progress_dialog)
+                self.active_download_key = nil
+                if ok then
+                    LibraryCache:setPdfPath(item.key, doc_path)
+                    LibraryCache:save()
+                    item.pdf_path = doc_path
+                    UIManager:show(InfoMessage:new{ text = _("Downloaded."), timeout = 2 })
+                else
+                    logger.warn("Zotero: failed to download", item.key, err)
+                    ZoteroQueue:push{
+                        item_key = item.key,
+                        webdav_url = self.settings.webdav_url,
+                        dest_dir = dest_dir,
+                    }
+                    UIManager:show(InfoMessage:new{
+                        text = _("Download failed — queued for retry. See \"Downloads\" for details."),
+                        timeout = 4,
+                    })
+                end
+                if entry then
+                    entry.text = itemLabel(item, true)
+                    if menu then menu:updateItems() end
+                end
+            end,
+            function(downloaded_bytes)
+                progress_dialog:reportProgress(downloaded_bytes)
+            end)
+    end)
 end
 
 --- Item list for one collection (or the whole library if collection_key

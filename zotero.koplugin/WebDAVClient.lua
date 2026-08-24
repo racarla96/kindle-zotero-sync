@@ -90,6 +90,33 @@ function WebDAVClient:_extractDocument(zip_path, item_key, dest_dir)
     return final_path, nil
 end
 
+--- Best-effort HEAD request to learn an attachment's zip size in bytes
+-- before downloading it, so a caller can size a progress bar accurately
+-- (see main.lua's downloadItemNow, which uses this to set
+-- ProgressbarDialog's `progress_max` before the actual download starts).
+-- Some servers omit Content-Length on HEAD (chunked transfer, etc.) — this
+-- returns nil in that case, which callers should treat as "unknown size":
+-- ProgressbarDialog itself already degrades gracefully (hides the bar)
+-- when handed a nil progress_max, so there's nothing extra to handle.
+function WebDAVClient:get_attachment_size(webdav_url, user, password, item_key)
+    local base = webdav_url:gsub("/*$", "/")
+    local zip_url = base .. item_key .. ".zip"
+
+    socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+    local code, headers = socket.skip(1, http.request{
+        url = zip_url,
+        method = "HEAD",
+        user = user,
+        password = password,
+    })
+    socketutil:reset_timeout()
+
+    if headers == nil or code ~= 200 then
+        return nil
+    end
+    return tonumber(headers["content-length"])
+end
+
 --- Download and extract one attachment. Synchronous — see file header for
 -- why that's the right trade-off here.
 -- @param webdav_url base WebDAV URL, e.g. "https://host/zotero/"
@@ -97,7 +124,11 @@ end
 -- @param item_key  Zotero attachment item key (the .zip is named {key}.zip)
 -- @param dest_dir  local directory to place the extracted document into
 -- @param callback  function(ok, doc_path_or_nil, error_message_or_nil)
-function WebDAVClient:download_attachment(webdav_url, user, password, item_key, dest_dir, callback)
+-- @param progress_callback optional function(bytes_downloaded_so_far) —
+--        forwarded to LuaSocket's sink via socketutil.chainSinkWithProgressCallback,
+--        the same helper/pattern KOReader's own WebDAV cloud-storage
+--        provider uses to drive its ProgressbarDialog.
+function WebDAVClient:download_attachment(webdav_url, user, password, item_key, dest_dir, callback, progress_callback)
     local base = webdav_url:gsub("/*$", "/")
     local zip_url = base .. item_key .. ".zip"
     local zip_path = dest_dir .. "/." .. item_key .. ".zip.part"
@@ -108,6 +139,11 @@ function WebDAVClient:download_attachment(webdav_url, user, password, item_key, 
         return
     end
 
+    local sink = ltn12.sink.file(out_file) -- closes out_file itself once done
+    if progress_callback then
+        sink = socketutil.chainSinkWithProgressCallback(sink, progress_callback)
+    end
+
     -- FILE_BLOCK_TIMEOUT/FILE_TOTAL_TIMEOUT: socketutil's own presets for
     -- "downloading a file, could be large" requests — the same ones
     -- KOReader's bundled WebDAV cloud-storage provider uses for this
@@ -116,7 +152,7 @@ function WebDAVClient:download_attachment(webdav_url, user, password, item_key, 
     local code, headers, status = socket.skip(1, http.request{
         url = zip_url,
         method = "GET",
-        sink = ltn12.sink.file(out_file), -- closes out_file itself once done
+        sink = sink,
         user = user,
         password = password,
     })
