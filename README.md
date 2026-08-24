@@ -90,10 +90,6 @@ This was built without a KOReader install or a physical Kindle to test against, 
 - **`filemanagerutil.getDefaultDir()`** (used for the download destination) and `Device.home_dir` on Kindle (`/mnt/us`) were verified directly against KOReader's current source rather than assumed, unlike most of the items above — comparatively low risk, but still unverified against a live install's actual `home_dir` setting.
 - Nothing here has exercised real KOReader event ordering (`onNetworkConnected`, `registerToMainMenu`, etc.) — only Lua syntax was verified (`luaL_loadfile` via a locally-built liblua5.1 checker), not runtime behavior.
 
-## Reference code, licensing
-
-This repo is licensed under **CC BY 4.0**. KOReader's `kosync.koplugin` — used only as a local architectural reference while writing `zotero.koplugin` — is **AGPL-3.0** and is **never committed here**: if you keep a local copy for reference, put it outside the repo or somewhere covered by `.gitignore` (see `CLAUDE.md` §2 for the reasoning).
-
 ## Licencia
 
 Este proyecto está licenciado bajo **Creative Commons Attribution 4.0 International (CC BY 4.0)**.
