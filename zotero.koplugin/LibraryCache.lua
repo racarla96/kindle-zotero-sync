@@ -20,9 +20,38 @@ local LibraryCache = {}
 local function default_state()
     return {
         library_version = 0,
-        items = {},       -- item_key -> { key, title, creators, collection_keys, tags, version, content_type, link_mode, parent_item, pdf_path, wanted }
+        items = {},       -- item_key -> { key, title, creators, collection_keys, tags, version, content_type, link_mode, filename, parent_item, pdf_path, wanted }
         collections = {}, -- collection_key -> { key, name, parent_collection }
     }
+end
+
+-- Attachment file extensions (lowercase, no dot) KOReader can open,
+-- per its documented supported formats (github.com/koreader/koreader,
+-- checked Aug 2026): PDF, DjVu, XPS, CBZ/CBT, FB2, PDB, TXT, HTML, RTF,
+-- CHM, EPUB, DOC, MOBI, ZIP. A few close siblings of those (docx, azw/
+-- azw3 as Mobi-family formats, cbr/cb7 as comic-archive siblings of
+-- cbz/cbt) are included too; drop them here if they turn out not to
+-- actually open on-device.
+local SUPPORTED_EXTENSIONS = {
+    pdf = true,
+    djvu = true, djv = true,
+    xps = true,
+    cbz = true, cbt = true, cbr = true, cb7 = true,
+    fb2 = true,
+    pdb = true,
+    txt = true,
+    html = true, htm = true,
+    rtf = true,
+    chm = true,
+    epub = true,
+    doc = true, docx = true,
+    mobi = true, azw = true, azw3 = true,
+    zip = true,
+}
+
+local function file_extension(filename)
+    if not filename then return nil end
+    return filename:match("%.([%a%d]+)$")
 end
 
 function LibraryCache:_storage()
@@ -90,6 +119,7 @@ function LibraryCache:mergeItems(api_items)
                 version = data.version,
                 content_type = data.contentType or (existing and existing.content_type),
                 link_mode = data.linkMode or (existing and existing.link_mode),
+                filename = data.filename or (existing and existing.filename),
                 parent_item = data.parentItem or (existing and existing.parent_item),
                 pdf_path = existing and existing.pdf_path,
                 wanted = existing and existing.wanted,
@@ -111,6 +141,10 @@ function LibraryCache:mergeCollections(api_collections)
     end
 end
 
+--- @param pdf_path the local path of the downloaded, extracted document —
+-- despite the name (kept as-is to avoid a data-migration/rename of the
+-- persisted field for already-synced libraries), this holds any
+-- KOReader-openable format now, not just PDF.
 function LibraryCache:setPdfPath(item_key, pdf_path)
     local state = self:load()
     if state.items[item_key] then
@@ -135,19 +169,31 @@ function LibraryCache:getItem(item_key)
     return self:load().items[item_key]
 end
 
-local function is_pdf_attachment(item)
+--- Is this item a downloadable attachment (imported file, not a link-only
+-- item) in a format KOReader can open? Checked against the attachment's
+-- `filename` extension first (Zotero's own `contentType` is unreliable
+-- for many formats, often just "application/octet-stream"); falls back
+-- to contentType == "application/pdf" for older cache entries synced
+-- before `filename` was tracked here, or if Zotero reports no filename.
+local function is_koreader_document(item)
+    if item.link_mode ~= "imported_file" and item.link_mode ~= "imported_url" then
+        return false
+    end
+    local ext = file_extension(item.filename)
+    if ext then
+        return SUPPORTED_EXTENSIONS[ext:lower()] == true
+    end
     return item.content_type == "application/pdf"
-        and (item.link_mode == "imported_file" or item.link_mode == "imported_url")
 end
 
---- @return array of item entries that are PDF attachments the user marked
--- as wanted (via the "Browse library" toggle) and that aren't downloaded
--- yet. Nothing downloads until the user has explicitly selected it.
+--- @return array of item entries that are KOReader-openable attachments
+-- the user marked as wanted (via the "Browse library" toggle) and that
+-- aren't downloaded yet. Nothing downloads until explicitly selected.
 function LibraryCache:getPendingAttachments()
     local state = self:load()
     local pending = {}
     for _, item in pairs(state.items) do
-        if is_pdf_attachment(item) and item.wanted and not item.pdf_path then
+        if is_koreader_document(item) and item.wanted and not item.pdf_path then
             table.insert(pending, item)
         end
     end
@@ -166,13 +212,13 @@ function LibraryCache:listCollections()
 end
 
 --- @param collection_key string|nil: restrict to one collection, or list
---        every PDF item in the library if nil.
+--        every KOReader-openable item in the library if nil.
 -- @return array of item entries, sorted by title.
 function LibraryCache:listItems(collection_key)
     local state = self:load()
     local list = {}
     for _, item in pairs(state.items) do
-        if is_pdf_attachment(item) then
+        if is_koreader_document(item) then
             local matches = not collection_key
             if collection_key and item.collection_keys then
                 for _, ck in ipairs(item.collection_keys) do

@@ -2,10 +2,12 @@
 Minimal WebDAV client for downloading Zotero attachment archives.
 
 Zotero's own WebDAV attachment storage (as opposed to the api.zotero.org
-metadata API covered by ZoteroClient.lua) isn't a JSON API: each PDF
-attachment is a plain `{item_key}.zip` file (plus a `.prop` sidecar KOReader
-doesn't need) served over HTTP with Basic Auth. There's no Spore spec for
-that — it's just a GET of a binary blob — so this module talks to it
+metadata API covered by ZoteroClient.lua) isn't a JSON API: each attachment
+(PDF, EPUB, or any other format KOReader can open — see LibraryCache's
+SUPPORTED_EXTENSIONS) is a plain `{item_key}.zip` file (plus a `.prop`
+sidecar KOReader doesn't need) served over HTTP with Basic Auth. There's
+no Spore spec for that — it's just a GET of a binary blob — so this module
+talks to it
 directly with KOReader's low-level `httpclient`, the same client the Spore
 AsyncHTTP middleware in ZoteroClient.lua uses under the hood, driven by a
 plain coroutine yield/resume instead of Spore's request pipeline.
@@ -35,9 +37,14 @@ local function shell_quote(s)
 end
 
 --- Unzip `zip_path` into a scratch dir under `dest_dir`, find the (single)
--- PDF inside, and move it to `dest_dir/{item_key}.pdf`.
--- @return pdf_path, nil on success — nil, error_message on failure
-function WebDAVClient:_extractPdf(zip_path, item_key, dest_dir)
+-- content file inside — Zotero's WebDAV attachment zips hold exactly one
+-- document plus a `.prop` metadata sidecar — and move it to
+-- `dest_dir/{item_key}.{original_extension}`. The extension is whatever
+-- Zotero shipped it as; LibraryCache already filtered the item against
+-- KOReader's supported formats before this ever gets called, so this
+-- layer doesn't re-check it — it just preserves whatever it finds.
+-- @return doc_path, nil on success — nil, error_message on failure
+function WebDAVClient:_extractDocument(zip_path, item_key, dest_dir)
     local extract_dir = dest_dir .. "/." .. item_key .. "_extract"
     os.execute("rm -rf " .. shell_quote(extract_dir))
     os.execute("mkdir -p " .. shell_quote(extract_dir))
@@ -52,16 +59,17 @@ function WebDAVClient:_extractPdf(zip_path, item_key, dest_dir)
         return nil, "unzip failed for " .. zip_path
     end
 
-    local pipe = io.popen("find " .. shell_quote(extract_dir) .. " -iname '*.pdf' -type f | head -n1")
+    local pipe = io.popen("find " .. shell_quote(extract_dir) .. " -type f -not -iname '*.prop' | head -n1")
     local found = pipe and pipe:read("*l")
     if pipe then pipe:close() end
 
     if not found or found == "" then
         os.execute("rm -rf " .. shell_quote(extract_dir))
-        return nil, "zip for " .. item_key .. " did not contain a PDF"
+        return nil, "zip for " .. item_key .. " did not contain a document"
     end
 
-    local final_path = dest_dir .. "/" .. item_key .. ".pdf"
+    local ext = found:match("%.([%a%d]+)$") or "bin"
+    local final_path = dest_dir .. "/" .. item_key .. "." .. ext
     os.remove(final_path) -- clear a stale file from a previous partial sync
     os.rename(found, final_path)
     os.execute("rm -rf " .. shell_quote(extract_dir))
@@ -72,8 +80,8 @@ end
 -- @param webdav_url base WebDAV URL, e.g. "https://host/zotero/"
 -- @param user, password  WebDAV Basic Auth credentials
 -- @param item_key  Zotero attachment item key (the .zip is named {key}.zip)
--- @param dest_dir  local directory to place the extracted PDF into
--- @param callback  function(ok, pdf_path_or_nil, error_message_or_nil)
+-- @param dest_dir  local directory to place the extracted document into
+-- @param callback  function(ok, doc_path_or_nil, error_message_or_nil)
 function WebDAVClient:download_attachment(webdav_url, user, password, item_key, dest_dir, callback)
     local base = webdav_url:gsub("/*$", "/")
     local zip_url = base .. item_key .. ".zip"
@@ -110,15 +118,15 @@ function WebDAVClient:download_attachment(webdav_url, user, password, item_key, 
         out_file:write(res.body or "")
         out_file:close()
 
-        local pdf_path, extract_err = self:_extractPdf(zip_path, item_key, dest_dir)
+        local doc_path, extract_err = self:_extractDocument(zip_path, item_key, dest_dir)
         os.remove(zip_path)
-        if not pdf_path then
+        if not doc_path then
             callback(false, nil, extract_err)
             return
         end
 
-        logger.dbg("WebDAVClient: downloaded", item_key, "->", pdf_path)
-        callback(true, pdf_path, nil)
+        logger.dbg("WebDAVClient: downloaded", item_key, "->", doc_path)
+        callback(true, doc_path, nil)
     end)
     coroutine.resume(co)
 end

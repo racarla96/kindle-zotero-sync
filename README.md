@@ -1,6 +1,6 @@
 # kindle-zotero-sync — zotero.koplugin
 
-A [KOReader](https://koreader.rocks/) plugin that syncs your [Zotero](https://www.zotero.org/) library — metadata via the Zotero Web API, PDF attachments via your own WebDAV server — and lets you browse and open items with KOReader's native reader, on a jailbroken e-ink Kindle.
+A [KOReader](https://koreader.rocks/) plugin that syncs your [Zotero](https://www.zotero.org/) library — metadata via the Zotero Web API, attachments via your own WebDAV server — and lets you browse and open items with KOReader's native reader, on a jailbroken e-ink Kindle.
 
 This is **not** a native GTK2/C app (that route was explored and dropped — see [`CLAUDE.md`](./CLAUDE.md) §2 for why). KOReader already solves PDF rendering, async HTTP, e-ink-friendly widgets, and settings persistence, so `zotero.koplugin` is plain Lua built on top of it, following the same architecture as KOReader's own [`kosync.koplugin`](https://github.com/koreader/koreader/tree/master/plugins/kosync.koplugin) (progress-sync plugin): a `WidgetContainer`-based entry point, a [Spore](https://github.com/koreader/koreader/tree/master/frontend/spore) REST client for the JSON API, and a disk-backed retry queue.
 
@@ -16,15 +16,18 @@ This is **not** a native GTK2/C app (that route was explored and dropped — see
 - ✅ **Fase 5** — [`zotero.koplugin/LibraryCache.lua`](./zotero.koplugin/LibraryCache.lua): local cache of items/collections + last synced library version (incremental sync).
 - ✅ **Fase 6** — [`zotero.koplugin/main.lua`](./zotero.koplugin/main.lua): FileManager menu, credentials dialog, sync orchestration, collection/item browser.
 - ✅ **`scripts/test_sync.sh` validated against a real Zotero account + WebDAV** — confirms the API key/user ID/WebDAV credential flow (see [Getting your Zotero API key](#getting-your-zotero-api-key-and-user-id) below) actually works end-to-end.
-- ⚠️ **Plugin itself untested on a real device.** All of `zotero.koplugin/` was written and syntax-checked (`luaL_loadfile` against liblua5.1) without access to a physical Kindle or a KOReader install; first real on-device run hit `Could not reach the Zotero API` even with confirmed-good credentials — see [Troubleshooting](#troubleshooting-could-not-reach-the-zotero-api-or-similar-errors-on-device) and [Known gaps](#known-gaps-before-relying-on-this) below.
+- ✅ **Plugin confirmed running on a real Kindle**: menu registers and renders correctly (Sync now / Browse library / Configure credentials / Downloads), credentials save. A first attempt at "Sync now" hit `Could not reach the Zotero API` — see [Troubleshooting](#troubleshooting-could-not-reach-the-zotero-api-or-similar-errors-on-device) — but a later run with the current code succeeded.
+- ⚠️ **Format filtering, the WebDAV enable toggle, the new "Downloads" status screen, and the `filemanagerutil`-based download directory are all new since that last confirmed device run** — written and syntax-checked (`luaL_loadfile` against liblua5.1) but not yet exercised on-device. See [Known gaps](#known-gaps-before-relying-on-this) below.
 
 ## How it works
 
-1. **Metadata** — [`ZoteroClient.lua`](./zotero.koplugin/ZoteroClient.lua) talks to the [Zotero Web API](https://www.zotero.org/support/dev/web_api/v3/start) (`api.zotero.org`), authenticated with an API key (`Zotero-API-Key` header). Sync is incremental: the cached `library/version` is sent as `?since=`, so a second sync only fetches what changed. Metadata is always synced for the **whole library** — that's what "Browse library" needs in order to show you something to pick from — but that's just JSON, no PDFs move yet.
-2. **PDF downloads are opt-in, per item.** Nothing downloads automatically just because it exists in your Zotero library. In **Browse library**, tapping an item that isn't downloaded yet toggles it as queued (`[queued for sync]`); tapping it again unmarks it. The next **Sync now** downloads only what's marked. Tapping an item that's already downloaded opens it in the reader instead.
-3. **PDF attachments** — instead of Zotero's own storage, this plugin expects a **WebDAV server you control**. Each attachment lives as `{item_key}.zip` on the WebDAV (the same layout Zotero's desktop client uses for WebDAV-based file sync) and is downloaded directly with HTTP Basic Auth via [`WebDAVClient.lua`](./zotero.koplugin/WebDAVClient.lua) — no Zotero storage quota involved.
-4. **Delivery** — PDFs are extracted into KOReader's own data directory (`{DataStorage}/zotero/`) and opened straight in KOReader's native reader; "Browse library" in the plugin menu never reimplements PDF rendering.
-5. **Resilience** — a failed download (network blip, WebDAV hiccup) is queued in [`ZoteroQueue.lua`](./zotero.koplugin/ZoteroQueue.lua) and retried automatically the next time KOReader reports the network as connected.
+1. **Metadata** — [`ZoteroClient.lua`](./zotero.koplugin/ZoteroClient.lua) talks to the [Zotero Web API](https://www.zotero.org/support/dev/web_api/v3/start) (`api.zotero.org`), authenticated with an API key (`Zotero-API-Key` header). Sync is incremental: the cached `library/version` is sent as `?since=`, so a second sync only fetches what changed. Metadata is always synced for the **whole library** — that's what "Browse library" needs in order to show you something to pick from — but that's just JSON, nothing downloads yet.
+2. **Only formats KOReader can open are shown at all.** `LibraryCache.lua` filters attachments by file extension against KOReader's [documented supported formats](https://github.com/koreader/koreader) — PDF, EPUB, DjVu, XPS, CBZ/CBT/CBR, FB2, PDB, TXT, HTML, RTF, CHM, DOC(X), MOBI/AZW(3), ZIP. Anything else (Zotero notes, web snapshots, unsupported attachment types) never appears in Browse library.
+3. **Downloads are opt-in, per item.** Nothing downloads automatically just because it exists in your Zotero library. In **Browse library**, tapping an item that isn't downloaded yet toggles it as queued (`[queued for sync]`); tapping it again unmarks it. The next **Sync now** downloads only what's marked. Tapping an item that's already downloaded opens it in the reader instead.
+4. **Attachments come from a WebDAV server you control**, instead of Zotero's own storage — **and it's off by default**. WebDAV only activates once you've both filled in the fields under **Configure credentials** *and* flipped **Enable WebDAV PDF downloads** on in the menu (an explicit checkbox-style toggle, not inferred from the fields being non-empty). Without it, metadata sync and item selection still work — items just stay queued forever, and "Downloads" tells you why. Once enabled, each attachment is downloaded as `{item_key}.zip` from the WebDAV (the layout Zotero's desktop client itself uses for WebDAV file sync) over HTTP Basic Auth via [`WebDAVClient.lua`](./zotero.koplugin/WebDAVClient.lua) — no Zotero storage quota involved.
+5. **Delivery** — documents are extracted into a `zotero/` subfolder of whatever KOReader considers its home/library directory (`filemanagerutil.getDefaultDir()` — respects a custom `home_dir` setting if you've set one, otherwise `Device.home_dir`, which is `/mnt/us` on Kindle). That means synced files show up automatically under **Home → zotero/** in KOReader's normal file browser, with no extra configuration — "Browse library → tap to open" also opens them directly, without needing to navigate there.
+6. **Resilience** — a failed download (network blip, WebDAV hiccup) is queued in [`ZoteroQueue.lua`](./zotero.koplugin/ZoteroQueue.lua) and retried automatically the next time KOReader reports the network as connected, or on demand from **Zotero → Downloads**.
+7. **"Downloads"** in the Zotero menu shows the full picture at any point: what's downloading right now, what's queued (selected, not yet attempted), what's waiting for a retry, and what's already on the device — see `Zotero:showDownloadsStatus()` in `main.lua`.
 
 ## Installing
 
@@ -32,8 +35,9 @@ This is **not** a native GTK2/C app (that route was explored and dropped — see
 2. Copy `zotero.koplugin/` into KOReader's `plugins/` directory on the device (typically `koreader/plugins/zotero.koplugin/`).
 3. Restart KOReader. A **Zotero** entry should appear in the FileManager's menu.
 4. Open **Zotero → Configure credentials** and fill in your API key, user ID, and WebDAV details (see below).
-5. Run **Zotero → Sync now** to pull metadata (no PDFs yet).
-6. Go to **Zotero → Browse library**, tap the items you actually want on the device to mark them, then run **Sync now** again to download just those.
+5. Run **Zotero → Sync now** to pull metadata (nothing downloads yet).
+6. Go to **Zotero → Browse library**, tap the items you actually want on the device to mark them.
+7. If you want attachments to actually download: toggle **Zotero → Enable WebDAV PDF downloads** on (only selectable once the WebDAV fields above are filled in), then run **Sync now** again. Check **Zotero → Downloads** any time to see what's downloading, queued, retrying, or already on the device.
 
 ## Getting your Zotero API key and user ID
 
@@ -77,11 +81,13 @@ The plugin's error messages are intentionally generic (e-ink, no room for stack 
 
 This was built without a KOReader install or a physical Kindle to test against, so a few spots are best-effort and flagged with `NOTE:` comments in the source — check these first if something doesn't work:
 
-- **`Menu` widget usage** in `main.lua` (item table shape, `onMenuSelect` signature, and `menu:updateItems()` to redraw a row in place after toggling its selection) follows the common pattern across KOReader plugins but wasn't run against a live `UIManager`.
-- **`ReaderUI:showReader(path)`** in `main.lua` is the standard way plugins hand a file to the reader — verify against a recent KOReader checkout if PDFs don't open as expected.
+- **`Menu` widget usage** in `main.lua` (item table shape, `onMenuSelect` signature, and `menu:updateItems()` to redraw a row in place after toggling its selection) follows the common pattern across KOReader plugins but wasn't run against a live `UIManager` — this includes the newer "Downloads" status screen.
+- **`ReaderUI:showReader(path)`** in `main.lua` is the standard way plugins hand a file to the reader — verify against a recent KOReader checkout if documents don't open as expected.
 - **Response header casing** (`Last-Modified-Version`) in `ZoteroClient.lua` is read case-insensitively as a hedge; confirm which casing KOReader's HTTP stack actually normalizes to.
 - **`require("mime").b64`** in `WebDAVClient.lua` (LuaSocket's `mime` module, for the Basic Auth header) is assumed present since KOReader bundles LuaSocket — confirm it resolves on-device.
 - KOReader ships a `webdav.koplugin` for cloud storage that's a closer precedent than `kosync.koplugin` for `WebDAVClient.lua`'s HTTP needs specifically — worth diffing against once you can test on-device.
+- **`SUPPORTED_EXTENSIONS`** in `LibraryCache.lua` is sourced from KOReader's own documented format list (confirmed via its GitHub README), but a few close siblings of the confirmed formats (docx, azw/azw3, cbr/cb7) were added by inference rather than individually confirmed — drop any that don't actually open.
+- **`filemanagerutil.getDefaultDir()`** (used for the download destination) and `Device.home_dir` on Kindle (`/mnt/us`) were verified directly against KOReader's current source rather than assumed, unlike most of the items above — comparatively low risk, but still unverified against a live install's actual `home_dir` setting.
 - Nothing here has exercised real KOReader event ordering (`onNetworkConnected`, `registerToMainMenu`, etc.) — only Lua syntax was verified (`luaL_loadfile` via a locally-built liblua5.1 checker), not runtime behavior.
 
 ## Reference code, licensing

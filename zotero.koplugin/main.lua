@@ -1,7 +1,7 @@
 --[[--
 Entry point for zotero.koplugin: registers a "Zotero" menu in FileManager,
-orchestrates metadata + PDF sync, and provides a minimal collections ->
-items -> open browser. Structured after kosync.koplugin's main.lua
+orchestrates metadata + document sync, and provides a minimal collections
+-> items -> open browser. Structured after kosync.koplugin's main.lua
 (WidgetContainer:extend, LuaSettings-backed settings, MultiInputDialog for
 credentials, NetworkMgr hooks for retrying queued work on reconnect) but
 this plugin is a library browser rather than a per-document sync, so it's
@@ -9,10 +9,16 @@ registered for FileManager (is_doc_only = false), not the reader.
 
 Sync is opt-in per item: a full sync always refreshes metadata for the
 whole library (cheap, needed so "Browse library" has something to select
-from), but a PDF is only downloaded once the user taps it in
+from), but a document is only downloaded once the user taps it in
 browseItems() to mark it `wanted` — see LibraryCache:setWanted/
 getPendingAttachments. Nothing downloads on its own just because it
-exists in the library.
+exists in the library. It's also filtered to formats KOReader can
+actually open (LibraryCache's SUPPORTED_EXTENSIONS) — not just PDF.
+
+WebDAV is entirely optional and off by default: without it (or with the
+"Enable WebDAV PDF downloads" menu toggle left off), metadata sync and
+browsing still work, items can still be marked wanted, but nothing ever
+downloads — see isWebDAVConfigured().
 
 NOTE on things that need on-device verification (no real KOReader install
 was available to test against while writing this):
@@ -33,6 +39,7 @@ local MultiInputDialog = require("ui/widget/multiinputdialog")
 local NetworkMgr = require("ui/network/manager")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local filemanagerutil = require("apps/filemanager/filemanagerutil")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local util = require("util")
@@ -56,17 +63,23 @@ local Zotero = WidgetContainer:extend{
 Zotero.default_settings = {
     api_key = nil,
     user_id = nil,
+    webdav_enabled = false,
     webdav_url = nil,
     webdav_user = nil,
     webdav_password = nil,
 }
 
---- Directory PDFs are extracted into — inside KOReader's own data dir
--- rather than /mnt/us/documents/ directly, so the plugin doesn't scatter
--- files across the user's book folder; "Open" pushes the reader straight
--- at the file regardless of where it lives.
-local function pdfDir()
-    local dir = DataStorage:getFullDataDir() .. "/zotero"
+--- Directory documents are extracted into: a "zotero" subfolder inside
+-- whatever KOReader considers its home/library directory —
+-- filemanagerutil.getDefaultDir() (respects the user's own "home_dir"
+-- setting if they configured one in KOReader, otherwise falls back to
+-- Device.home_dir — "/mnt/us" on Kindle, verified against KOReader's
+-- actual source rather than assumed). Nested in a subfolder instead of
+-- dropped straight into the root so synced items don't scatter loose
+-- through the user's existing library, but it still shows up
+-- automatically under Home -> zotero/ with no extra configuration.
+local function documentDir()
+    local dir = filemanagerutil.getDefaultDir() .. "/zotero"
     if not lfs.attributes(dir, "mode") then
         lfs.mkdir(dir)
     end
@@ -89,7 +102,7 @@ end
 
 function Zotero:init()
     self:loadSettings()
-    -- Drain any queued PDF downloads whenever we come back online.
+    -- Drain any queued downloads whenever we come back online.
     self.onNetworkConnected = self._onNetworkConnected
     self.ui.menu:registerToMainMenu(self)
 end
@@ -99,7 +112,22 @@ function Zotero:isConfigured()
         and self.settings.user_id and self.settings.user_id ~= ""
 end
 
+--- WebDAV fields being filled in isn't enough on its own — downloads only
+-- happen once the user has also explicitly flipped the "Enable WebDAV PDF
+-- downloads" menu toggle on. Keeps "I don't want this yet" an explicit,
+-- persisted choice rather than something inferred from which text fields
+-- happen to be non-empty.
 function Zotero:isWebDAVConfigured()
+    return self.settings.webdav_enabled
+        and self.settings.webdav_url and self.settings.webdav_url ~= ""
+        and self.settings.webdav_user and self.settings.webdav_user ~= ""
+        and self.settings.webdav_password and self.settings.webdav_password ~= ""
+end
+
+--- Are the WebDAV text fields filled in (regardless of the enable
+-- toggle)? Used to gate the toggle itself: no point letting the user
+-- flip "on" before there's anything to connect to.
+function Zotero:hasWebDAVFields()
     return self.settings.webdav_url and self.settings.webdav_url ~= ""
         and self.settings.webdav_user and self.settings.webdav_user ~= ""
         and self.settings.webdav_password and self.settings.webdav_password ~= ""
@@ -126,15 +154,29 @@ function Zotero:addToMainMenu(menu_items)
                 callback = function() self:showCredentialsDialog() end,
             },
             {
-                text_func = function()
-                    local pending = ZoteroQueue:count()
-                    return pending > 0
-                        and T(_("Retry queue (%1 pending)"), pending)
-                        or _("Retry queue (empty)")
-                end,
-                enabled_func = function() return ZoteroQueue:count() > 0 end,
+                text = _("Enable WebDAV PDF downloads"),
+                checked_func = function() return self.settings.webdav_enabled end,
+                enabled_func = function() return self:hasWebDAVFields() end,
+                help_text = _("Off by default. Fill in the WebDAV fields under \"Configure credentials\" first, then enable this — without it, sync still updates metadata and lets you select items, but nothing ever downloads."),
                 keep_menu_open = true,
-                callback = function() self:drainQueue(true) end,
+                callback = function()
+                    self.settings.webdav_enabled = not self.settings.webdav_enabled
+                    self.updated = true
+                end,
+                separator = true,
+            },
+            {
+                text_func = function()
+                    local pending = #LibraryCache:getPendingAttachments()
+                    local retrying = ZoteroQueue:count()
+                    if self.active_download_key then pending = pending + 1 end
+                    if pending == 0 and retrying == 0 then
+                        return _("Downloads")
+                    end
+                    return T(_("Downloads (%1 pending, %2 retrying)"), pending, retrying)
+                end,
+                keep_menu_open = true,
+                callback = function() self:showDownloadsStatus() end,
             },
         },
     }
@@ -192,7 +234,7 @@ end
 
 --- Full sync: pull collections + item metadata (incrementally, via the
 -- cached library version) for the *whole* library — that's what "Browse
--- library" has to select from — then download only the PDF attachments
+-- library" has to select from — then download only the documents
 -- the user has explicitly marked as wanted there (see browseItems).
 function Zotero:sync(interactive)
     if not self:isConfigured() then
@@ -245,9 +287,17 @@ function Zotero:sync(interactive)
             local changed = #items
             self:downloadPendingAttachments(function(downloaded, failed)
                 if interactive then
-                    local extra = failed > 0 and T(_(", %1 queued for retry"), failed) or ""
+                    local extra
+                    if not self:isWebDAVConfigured() then
+                        local pending = #LibraryCache:getPendingAttachments()
+                        extra = pending > 0
+                            and T(_(" (%1 selected item(s) need WebDAV enabled to download — see \"Enable WebDAV PDF downloads\")"), pending)
+                            or ""
+                    else
+                        extra = failed > 0 and T(_(", %1 queued for retry"), failed) or ""
+                    end
                     UIManager:show(InfoMessage:new{
-                        text = T(_("Sync complete: %1 metadata change(s), %2 PDF(s) downloaded%3."),
+                        text = T(_("Sync complete: %1 metadata change(s), %2 document(s) downloaded%3."),
                             changed, downloaded, extra),
                         timeout = 4,
                     })
@@ -261,7 +311,8 @@ end
 -- on disk yet, one at a time (sequential on purpose: e-ink WebDAV servers
 -- are usually small personal boxes, not something to hammer with parallel
 -- requests). Failures are pushed onto ZoteroQueue instead of aborting the
--- batch.
+-- batch. `self.active_download_key` tracks which item (if any) is
+-- in flight right now, for showDownloadsStatus() to display.
 -- @param done_callback function(downloaded_count, failed_count)
 function Zotero:downloadPendingAttachments(done_callback)
     if not self:isWebDAVConfigured() then
@@ -270,26 +321,29 @@ function Zotero:downloadPendingAttachments(done_callback)
     end
 
     local pending = LibraryCache:getPendingAttachments()
-    local dest_dir = pdfDir()
+    local dest_dir = documentDir()
     local downloaded, failed = 0, 0
 
     local function download_one(i)
         local item = pending[i]
         if not item then
+            self.active_download_key = nil
             LibraryCache:save()
             if done_callback then done_callback(downloaded, failed) end
             return
         end
 
+        self.active_download_key = item.key
         WebDAVClient:download_attachment(
             self.settings.webdav_url,
             self.settings.webdav_user,
             self.settings.webdav_password,
             item.key,
             dest_dir,
-            function(ok, pdf_path, err)
+            function(ok, doc_path, err)
+                self.active_download_key = nil
                 if ok then
-                    LibraryCache:setPdfPath(item.key, pdf_path)
+                    LibraryCache:setPdfPath(item.key, doc_path)
                     downloaded = downloaded + 1
                 else
                     logger.warn("Zotero: failed to download", item.key, err)
@@ -314,15 +368,17 @@ function Zotero:drainQueue(interactive)
         return
     end
     ZoteroQueue:drain(function(item, cb)
+        self.active_download_key = item.item_key
         WebDAVClient:download_attachment(
             self.settings.webdav_url,
             self.settings.webdav_user,
             self.settings.webdav_password,
             item.item_key,
             item.dest_dir,
-            function(ok, pdf_path)
+            function(ok, doc_path)
+                self.active_download_key = nil
                 if ok then
-                    LibraryCache:setPdfPath(item.item_key, pdf_path)
+                    LibraryCache:setPdfPath(item.item_key, doc_path)
                     LibraryCache:save()
                 end
                 cb(ok)
@@ -345,11 +401,78 @@ function Zotero:_onNetworkConnected()
     end)
 end
 
+--- "Downloads" entry point: everything currently downloading, queued
+-- (selected but not yet attempted), waiting for a retry, and already on
+-- the device, in that order. Answers "what's my download queue actually
+-- doing" beyond the bare pending-count the main menu shows.
+function Zotero:showDownloadsStatus()
+    local item_table = {}
+
+    if self.active_download_key then
+        local cached = LibraryCache:getItem(self.active_download_key)
+        local label = (cached and cached.title) or self.active_download_key
+        table.insert(item_table, { text = label .. "  [" .. _("downloading…") .. "]" })
+    end
+
+    for _, item in ipairs(LibraryCache:getPendingAttachments()) do
+        if item.key ~= self.active_download_key then
+            table.insert(item_table, { text = (item.title or item.key) .. "  [" .. _("queued") .. "]" })
+        end
+    end
+
+    local queue = ZoteroQueue:load()
+    if #queue > 0 then
+        table.insert(item_table, { text = "↻ " .. _("Retry all now"), is_retry_action = true, separator = true })
+        for _, entry in ipairs(queue) do
+            local cached = LibraryCache:getItem(entry.item_key)
+            local label = (cached and cached.title) or entry.item_key
+            table.insert(item_table, { text = label .. "  [" .. _("retry pending") .. "]" })
+        end
+    end
+
+    for _, item in pairs(LibraryCache:load().items) do
+        if item.pdf_path then
+            table.insert(item_table, {
+                text = (item.title or item.key) .. "  [" .. _("on device") .. "]",
+                zotero_item = item,
+            })
+        end
+    end
+
+    if #item_table == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("Nothing queued, retrying, or downloaded yet."),
+            timeout = 3,
+        })
+        return
+    end
+
+    local menu
+    menu = Menu:new{
+        title = _("Zotero downloads"),
+        item_table = item_table,
+        onMenuSelect = function(_self, entry)
+            if entry.is_retry_action then
+                UIManager:close(menu)
+                self:drainQueue(true)
+                return
+            end
+            if entry.zotero_item and entry.zotero_item.pdf_path
+                    and lfs.attributes(entry.zotero_item.pdf_path, "mode") then
+                UIManager:close(menu)
+                self:openDocument(entry.zotero_item.pdf_path)
+            end
+        end,
+        close_callback = function() UIManager:close(menu) end,
+    }
+    UIManager:show(menu)
+end
+
 --- "Browse library" entry point: a flat list of collections, plus an
--- "All PDFs" shortcut, each opening the item list for that scope.
+-- "All documents" shortcut, each opening the item list for that scope.
 function Zotero:browseCollections()
     local collections = LibraryCache:listCollections()
-    local item_table = { { text = _("All PDFs") } }
+    local item_table = { { text = _("All documents") } }
     for _, collection in ipairs(collections) do
         table.insert(item_table, {
             text = collection.name or collection.key,
@@ -385,12 +508,12 @@ end
 -- item that isn't downloaded toggles whether it's queued for the next
 -- "Sync now" (nothing downloads on its own); tapping an already-downloaded
 -- item opens it in the reader instead, since "queue this again" isn't a
--- useful action once the PDF is already on the device.
+-- useful action once it's already on the device.
 function Zotero:browseItems(collection_key)
     local items = LibraryCache:listItems(collection_key)
     if #items == 0 then
         UIManager:show(InfoMessage:new{
-            text = _("No PDF items here yet. Try \"Sync now\" first."),
+            text = _("No documents here yet. Try \"Sync now\" first."),
             timeout = 3,
         })
         return
@@ -409,7 +532,7 @@ function Zotero:browseItems(collection_key)
             local item = entry.zotero_item
             if item.pdf_path and lfs.attributes(item.pdf_path, "mode") then
                 UIManager:close(menu)
-                self:openPdf(item.pdf_path)
+                self:openDocument(item.pdf_path)
                 return
             end
             -- Not downloaded yet: this tap only toggles selection, no
@@ -426,10 +549,10 @@ function Zotero:browseItems(collection_key)
     UIManager:show(menu)
 end
 
-function Zotero:openPdf(pdf_path)
+function Zotero:openDocument(doc_path)
     local ReaderUI = require("apps/reader/readerui")
     UIManager:scheduleIn(0.1, function()
-        ReaderUI:showReader(pdf_path)
+        ReaderUI:showReader(doc_path)
     end)
 end
 
