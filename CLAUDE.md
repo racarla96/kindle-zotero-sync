@@ -183,3 +183,22 @@ A petición del usuario: se quitó el texto extra del checkbox ("(needs the WebD
 - El botón lee los campos actuales con `dialog:getFields()` (sin necesidad de haber pulsado Save antes) y llama a `ZoteroClient:get_library_version()` (ya existente, reutilizado tal cual) para probar la API de Zotero, y al nuevo `WebDAVClient:test_connection()` para probar el WebDAV — un simple `GET` a la URL base con Basic Auth: `401` = credenciales rechazadas, cualquier otro código = credenciales aceptadas (no hace falta que exista ningún archivo concreto).
 - Resultado mostrado en un único `InfoMessage` con el estado de ambos por separado.
 - Verificado con el syntax-checker local; la combinación específica de este botón dentro del diálogo (como todo lo demás en esta sesión) no se ha probado en un KOReader real todavía.
+
+## 14. Causa raíz real del crash de "Downloads" — confirmada con `crash.log` real
+
+El usuario copió `/mnt/us/koreader/crash.log` al directorio del repo (fuera de git, se descartó tras leerlo). Traceback real:
+
+```
+./luajit: plugins/zotero.koplugin/main.lua:420: attempt to call local '_' (a number value)
+stack traceback:
+	plugins/zotero.koplugin/main.lua:420: in function 'showDownloadsStatus'
+	plugins/zotero.koplugin/main.lua:180: in function 'callback'
+	...
+```
+
+**Causa raíz real, distinta de lo que se había arreglado en la §12:** `main.lua` hace `local _ = require("gettext")` a nivel de archivo. Tres bucles dentro de `_showDownloadsStatusImpl()` usaban `for _, x in ipairs(...) do ... _("algo") ... end` — la variable de descarte del bucle también se llamaba `_`, así que dentro del cuerpo del bucle tapaba a la función de traducción con el índice numérico del bucle. Al llamar `_("queued")` etc., Lua intentaba "llamar" un número → exactamente el mensaje del crash.
+
+- El log también confirma que el `pcall` de la §12 **sí funcionó**: la segunda vez que el usuario probó (ya con esa versión desplegada), el mismo bug quedó como `WARN Zotero: showDownloadsStatus failed: ...` en el log en vez de crashear KOReader — buena señal de que esa mitigación defensiva era correcta, aunque no arreglara la causa real.
+- Fix real: renombradas TODAS las variables de descarte `for _, ...` de `main.lua` a `_i`/`_key` (los otros 4 archivos del plugin no hacen `require("gettext")` como `_`, así que nunca tuvieron este riesgo — verificado con grep). `browseCollections`/`browseItems` nunca crashearon porque sus bucles no llaman a `_(...)` directamente dentro del cuerpo (pasan por `itemLabel()`, una función definida fuera del bucle, cuyo `_` interno sí resuelve bien por scope léxico) — muestra de que el bug es específico de cómo se escribe el bucle, no de usar `_` como nombre en general.
+- **Extendido el mismo aprendizaje al botón "Test connection"** (§13): su `callback` ahora usa un helper `guard(fn)` que envuelve en `pcall` tanto el setup síncrono como CADA callback async por separado (el `get_library_version` y el `test_connection` de WebDAV) — un solo `pcall` alrededor de la función exterior no habría protegido los callbacks async, que corren más tarde, fuera del alcance dinámico de ese `pcall`. Esta ya se escribió bien desde el principio, sin necesidad de otro ciclo de crash-fix.
+- Pendiente de verificar en el dispositivo real: si con estos cambios "Downloads" ya no crashea y muestra el listado correctamente.

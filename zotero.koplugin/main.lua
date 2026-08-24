@@ -252,43 +252,69 @@ function Zotero:showCredentialsDialog()
             {
                 {
                     text = _("Test connection"),
+                    -- `guard()` wraps every phase of this button's async
+                    -- flow (the initial synchronous setup AND each of the
+                    -- two async callbacks below) in its own pcall, not
+                    -- just the outermost call — an error inside an async
+                    -- callback runs later, outside the dynamic scope of
+                    -- any pcall around the code that *kicked off* the
+                    -- request, so wrapping only the outer function would
+                    -- miss it. This matters because we now have direct
+                    -- evidence (see CLAUDE.md) that an uncaught error in
+                    -- an event callback hard-crashes KOReader instead of
+                    -- failing gracefully.
                     callback = function()
-                        local f = readFields()
-                        if f.api_key == "" or f.user_id == "" then
-                            UIManager:show(InfoMessage:new{
-                                text = _("Fill in the Zotero API key and user ID first."),
-                                timeout = 3,
-                            })
-                            return
+                        local function guard(fn)
+                            return function(...)
+                                local ok, err = pcall(fn, ...)
+                                if not ok then
+                                    logger.warn("Zotero: Test connection failed:", err)
+                                    UIManager:show(InfoMessage:new{
+                                        text = _("Test failed unexpectedly — check koreader.log for details."),
+                                        timeout = 3,
+                                    })
+                                end
+                            end
                         end
 
-                        UIManager:show(InfoMessage:new{ text = _("Testing…"), timeout = 1 })
-
-                        local function showResult(zotero_ok, webdav_line)
-                            local lines = {
-                                zotero_ok and _("Zotero API: OK")
-                                    or _("Zotero API: failed — check the API key and user ID"),
-                            }
-                            if webdav_line then table.insert(lines, webdav_line) end
-                            UIManager:show(InfoMessage:new{
-                                text = table.concat(lines, "\n"),
-                                timeout = 6,
-                            })
-                        end
-
-                        local client = ZoteroClient:new{ service_spec = self.path .. "/api_zotero.json" }
-                        client:get_library_version(f.api_key, f.user_id, function(zotero_ok)
-                            local has_webdav_fields = f.webdav_url ~= "" and f.webdav_user ~= "" and f.webdav_password ~= ""
-                            if not has_webdav_fields then
-                                showResult(zotero_ok, nil)
+                        guard(function()
+                            local f = readFields()
+                            if f.api_key == "" or f.user_id == "" then
+                                UIManager:show(InfoMessage:new{
+                                    text = _("Fill in the Zotero API key and user ID first."),
+                                    timeout = 3,
+                                })
                                 return
                             end
-                            WebDAVClient:test_connection(f.webdav_url, f.webdav_user, f.webdav_password,
-                                function(webdav_ok, detail)
-                                    showResult(zotero_ok, (webdav_ok and _("WebDAV: OK") or _("WebDAV: failed"))
-                                        .. " (" .. detail .. ")")
-                                end)
-                        end)
+
+                            UIManager:show(InfoMessage:new{ text = _("Testing…"), timeout = 1 })
+
+                            local function showResult(zotero_ok, webdav_line)
+                                local lines = {
+                                    zotero_ok and _("Zotero API: OK")
+                                        or _("Zotero API: failed — check the API key and user ID"),
+                                }
+                                if webdav_line then table.insert(lines, webdav_line) end
+                                UIManager:show(InfoMessage:new{
+                                    text = table.concat(lines, "\n"),
+                                    timeout = 6,
+                                })
+                            end
+
+                            local client = ZoteroClient:new{ service_spec = self.path .. "/api_zotero.json" }
+                            client:get_library_version(f.api_key, f.user_id, guard(function(zotero_ok)
+                                local has_webdav_fields = f.webdav_url ~= "" and f.webdav_user ~= "" and f.webdav_password ~= ""
+                                if not has_webdav_fields then
+                                    showResult(zotero_ok, nil)
+                                    return
+                                end
+                                WebDAVClient:test_connection(f.webdav_url, f.webdav_user, f.webdav_password,
+                                    guard(function(webdav_ok, detail)
+                                        showResult(zotero_ok, (webdav_ok and _("WebDAV: OK") or _("WebDAV: failed"))
+                                            .. " (" .. detail .. ")")
+                                    end))
+                            end))
+                        end)()
                     end,
                 },
             },
@@ -505,7 +531,14 @@ function Zotero:_showDownloadsStatusImpl()
         table.insert(item_table, { text = label .. "  [" .. _("downloading…") .. "]" })
     end
 
-    for _, item in ipairs(LibraryCache:getPendingAttachments()) do
+    -- NOTE: this is exactly the bug that crashed KOReader before (see
+    -- CLAUDE.md §12/§14): `_` is aliased to gettext at the top of this
+    -- file, so a `for _, x in ipairs(...)` loop that also calls `_(...)`
+    -- inside its own body shadows the translator with the loop's index
+    -- (a number) and throws "attempt to call local '_' (a number
+    -- value)" the moment it tries to translate anything. None of the
+    -- loops below reuse `_` as their discarded variable, on purpose.
+    for _i, item in ipairs(LibraryCache:getPendingAttachments()) do
         if item.key ~= self.active_download_key then
             table.insert(item_table, { text = (item.title or item.key) .. "  [" .. _("queued") .. "]" })
         end
@@ -514,14 +547,14 @@ function Zotero:_showDownloadsStatusImpl()
     local queue = ZoteroQueue:load()
     if #queue > 0 then
         table.insert(item_table, { text = _("Retry all now"), is_retry_action = true })
-        for _, entry in ipairs(queue) do
+        for _i, entry in ipairs(queue) do
             local cached = LibraryCache:getItem(entry.item_key)
             local label = (cached and cached.title) or entry.item_key
             table.insert(item_table, { text = label .. "  [" .. _("retry pending") .. "]" })
         end
     end
 
-    for _, item in pairs(LibraryCache:load().items) do
+    for _key, item in pairs(LibraryCache:load().items) do
         if item.pdf_path then
             table.insert(item_table, {
                 text = (item.title or item.key) .. "  [" .. _("on device") .. "]",
@@ -564,7 +597,7 @@ end
 function Zotero:browseCollections()
     local collections = LibraryCache:listCollections()
     local item_table = { { text = _("All documents") } }
-    for _, collection in ipairs(collections) do
+    for _i, collection in ipairs(collections) do
         table.insert(item_table, {
             text = collection.name or collection.key,
             collection_key = collection.key,
@@ -616,7 +649,7 @@ function Zotero:browseItems(collection_key)
     end
 
     local item_table = {}
-    for _, item in ipairs(items) do
+    for _i, item in ipairs(items) do
         local supported = LibraryCache:isSupportedFormat(item)
         table.insert(item_table, {
             text = itemLabel(item, supported),
