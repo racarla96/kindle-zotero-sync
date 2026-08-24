@@ -1,3 +1,7 @@
+# Referencia AGPL-3.0 (kosync.koplugin de KOReader) — consulta local
+# únicamente, nunca se commitea a este repo CC BY 4.0. Ver CLAUDE.md §2.
+example/
+
 # Credenciales locales (nunca commitear)
 config/config.json
 

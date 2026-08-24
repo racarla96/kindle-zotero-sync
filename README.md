@@ -1,74 +1,72 @@
-# kindle-zotero-sync
+# kindle-zotero-sync — zotero.koplugin
 
-Sincroniza tu biblioteca de [Zotero](https://www.zotero.org/) (metadata vía API REST + PDFs vía tu propio servidor WebDAV) a un Kindle e-ink jailbreado, dejando los PDFs listos para el lector nativo del dispositivo.
+A [KOReader](https://koreader.rocks/) plugin that syncs your [Zotero](https://www.zotero.org/) library — metadata via the Zotero Web API, PDF attachments via your own WebDAV server — and lets you browse and open items with KOReader's native reader, on a jailbroken e-ink Kindle.
 
-Este no es un port de la app oficial de Zotero para Android — es un proyecto nuevo, específico para el framework del Kindle (Linux embebido + GTK2 / KUAL).
+This is **not** a native GTK2/C app (that route was explored and dropped — see [`CLAUDE.md`](./CLAUDE.md) §2 for why). KOReader already solves PDF rendering, async HTTP, e-ink-friendly widgets, and settings persistence, so `zotero.koplugin` is plain Lua built on top of it, following the same architecture as KOReader's own [`kosync.koplugin`](https://github.com/koreader/koreader/tree/master/plugins/kosync.koplugin) (progress-sync plugin): a `WidgetContainer`-based entry point, a [Spore](https://github.com/koreader/koreader/tree/master/frontend/spore) REST client for the JSON API, and a disk-backed retry queue.
 
-> El brief técnico completo del proyecto, con todas las fases planeadas, está en [`CLAUDE.md`](./CLAUDE.md).
+> The full technical brief — architecture rationale, phase-by-phase task list, API details — lives in [`CLAUDE.md`](./CLAUDE.md).
 
-## Estado actual
+## Status
 
-- ✅ **Fase 0** — Repositorio creado, licenciado bajo CC BY 4.0.
-- ✅ **Fase 1** — [`scripts/test_sync.sh`](./scripts/test_sync.sh): prueba end-to-end en bash/curl que lista la biblioteca, descarga un PDF desde el WebDAV y valida el resultado.
-- ⏳ **Fase 2** — Motor de sync nativo en C (libcurl + libzip/minizip + SQLite). Pendiente.
-- ⏳ **Fase 3** — UI e-ink (GTK2 o Mesquito/KUAL). Pendiente.
-- ⏳ **Fase 4** — Empaquetado KPM para KindleModding. Pendiente.
+- ✅ **Fase 0** — Repository, CC BY 4.0 license.
+- ✅ **Fase 1** — [`zotero.koplugin/api_zotero.json`](./zotero.koplugin/api_zotero.json): Spore spec for the Zotero Web API.
+- ✅ **Fase 2** — [`zotero.koplugin/ZoteroClient.lua`](./zotero.koplugin/ZoteroClient.lua): Spore-based client (library version, incremental item listing, collections).
+- ✅ **Fase 3** — [`zotero.koplugin/WebDAVClient.lua`](./zotero.koplugin/WebDAVClient.lua): downloads + extracts attachment `.zip`s from the WebDAV over Basic Auth.
+- ✅ **Fase 4** — [`zotero.koplugin/ZoteroQueue.lua`](./zotero.koplugin/ZoteroQueue.lua): retry queue for failed downloads, drained on reconnect.
+- ✅ **Fase 5** — [`zotero.koplugin/LibraryCache.lua`](./zotero.koplugin/LibraryCache.lua): local cache of items/collections + last synced library version (incremental sync).
+- ✅ **Fase 6** — [`zotero.koplugin/main.lua`](./zotero.koplugin/main.lua): FileManager menu, credentials dialog, sync orchestration, collection/item browser.
+- ⚠️ **Untested on a real device.** All of the above was written and syntax-checked (`luaL_loadfile` against liblua5.1) without access to a physical Kindle or a KOReader install — see [Known gaps](#known-gaps-before-relying-on-this) below before trusting it with your library.
 
-## Cómo funciona
+## How it works
 
-1. **Metadata**: se consulta la [API REST de Zotero](https://www.zotero.org/support/dev/web_api/v3/start) (`api.zotero.org`), autenticada con una API key, para listar ítems de la biblioteca. El sync incremental usa el header `library/version` + el parámetro `?since=` para pedir solo los cambios.
-2. **Adjuntos (PDFs)**: en vez del storage de Zotero, se usa un **WebDAV propio**. Cada adjunto vive como `{key}.zip` (más un `.prop` con metadata) en el WebDAV, y se descarga con HTTP Basic Auth.
-3. **Entrega**: los PDFs extraídos se copian a `/mnt/us/documents/` para que los abra el lector nativo del Kindle.
+1. **Metadata** — [`ZoteroClient.lua`](./zotero.koplugin/ZoteroClient.lua) talks to the [Zotero Web API](https://www.zotero.org/support/dev/web_api/v3/start) (`api.zotero.org`), authenticated with an API key (`Zotero-API-Key` header). Sync is incremental: the cached `library/version` is sent as `?since=`, so a second sync only fetches what changed.
+2. **PDF attachments** — instead of Zotero's own storage, this plugin expects a **WebDAV server you control**. Each attachment lives as `{item_key}.zip` on the WebDAV (the same layout Zotero's desktop client uses for WebDAV-based file sync) and is downloaded directly with HTTP Basic Auth via [`WebDAVClient.lua`](./zotero.koplugin/WebDAVClient.lua) — no Zotero storage quota involved.
+3. **Delivery** — PDFs are extracted into KOReader's own data directory (`{DataStorage}/zotero/`) and opened straight in KOReader's native reader; "Browse library" in the plugin menu never reimplements PDF rendering.
+4. **Resilience** — a failed download (network blip, WebDAV hiccup) is queued in [`ZoteroQueue.lua`](./zotero.koplugin/ZoteroQueue.lua) and retried automatically the next time KOReader reports the network as connected.
 
-## Configuración de credenciales
+## Installing
 
-1. Copia la plantilla:
-   ```bash
-   cp config/config.example.json config/config.json
-   ```
-2. Rellena `config/config.json` (este archivo **no se sube al repo**, está en `.gitignore`):
+1. Jailbreak your Kindle and install KOReader — see [kindlemodding.org](https://kindlemodding.org/) and the [KOReader install guide](https://github.com/koreader/koreader/wiki/Installation-on-Kindle-devices).
+2. Copy `zotero.koplugin/` into KOReader's `plugins/` directory on the device (typically `koreader/plugins/zotero.koplugin/`).
+3. Restart KOReader. A **Zotero** entry should appear in the FileManager's menu.
+4. Open **Zotero → Configure credentials** and fill in your API key, user ID, and WebDAV details (see below).
+5. Run **Zotero → Sync now**.
 
-   ```json
-   {
-     "zotero_api_key": "",
-     "zotero_user_id": "",
-     "webdav_url": "https://zotero.racarla.es/zotero/",
-     "webdav_user": "racarla96",
-     "webdav_password": ""
-   }
-   ```
+## Getting your Zotero API key and user ID
 
-### Obtener tu API key de Zotero
+1. Log into [zotero.org](https://www.zotero.org/) and go to **Settings → Security** ([zotero.org/settings/security](https://www.zotero.org/settings/security)).
+2. Under **Applications**, click **Create new private key**. Give it a name (e.g. "kindle-sync") and grant at least **Allow library access** (read-only is enough).
+3. Copy the generated key — Zotero only shows it once.
+4. On the same page, your **userID for use in API calls** is shown near the top; copy that number too.
 
-1. Inicia sesión en [zotero.org](https://www.zotero.org/) y ve a **Settings → Security** (o directamente [zotero.org/settings/security](https://www.zotero.org/settings/security)).
-2. En la sección **Applications**, pulsa **Create new private key**.
-3. Dale un nombre descriptivo (ej. "kindle-sync") y marca al menos **Allow library access** (lectura). No necesitas permisos de escritura para esta fase.
-4. Guarda la key generada — Zotero solo la muestra una vez — y pégala en `zotero_api_key`.
+WebDAV credentials are the same ones configured in Zotero's own **Settings → Sync → File Syncing → WebDAV** — this plugin reads from that same server, it doesn't set it up for you.
 
-### Obtener tu User ID de Zotero
+## Testing the sync flow without the plugin
 
-1. En la misma página de [Settings → Security](https://www.zotero.org/settings/security), tu **userID** aparece en la sección "Your userID for use in API calls is *NNNNNNN*".
-2. Cópialo tal cual (es un número) en `zotero_user_id`.
-
-### Credenciales del WebDAV
-
-`webdav_user` y `webdav_password` son las mismas que configuraste en Zotero (**Settings → Sync → File Syncing → WebDAV**) para que el propio Zotero sincronice adjuntos contra tu servidor. `webdav_url` es la URL base donde Zotero deja los `.zip` de cada adjunto.
-
-## Ejecutar la prueba end-to-end
-
-Requiere `curl`, `jq`, `unzip` y `file` instalados.
+[`scripts/test_sync.sh`](./scripts/test_sync.sh) is a standalone bash/curl script that exercises the same flow (list library → find a PDF attachment → download its `.zip` from WebDAV → extract → validate) outside of KOReader, useful for confirming credentials/connectivity before trusting the Lua plugin with them:
 
 ```bash
+cp config/config.example.json config/config.json
+# fill in config/config.json — see § above for how to get these values
 ./scripts/test_sync.sh
 ```
 
-El script:
-1. Lista tu biblioteca vía la API de Zotero.
-2. Busca el primer adjunto PDF importado.
-3. Descarga su `.zip` desde el WebDAV con Basic Auth.
-4. Lo descomprime y valida que el PDF extraído sea válido.
+`config/config.json` is only used by this test script and is gitignored. The plugin itself stores credentials separately, in KOReader's own `LuaSettings` (`{DataStorage}/settings/zotero.lua`), set via the in-app "Configure credentials" dialog.
 
-Los archivos temporales quedan en `scripts/tmp/` (ignorado por git).
+## Known gaps before relying on this
+
+This was built without a KOReader install or a physical Kindle to test against, so a few spots are best-effort and flagged with `NOTE:` comments in the source — check these first if something doesn't work:
+
+- **`Menu` widget usage** in `main.lua` (item table shape, `onMenuSelect` signature) follows the common pattern across KOReader plugins but wasn't run against a live `UIManager`.
+- **`ReaderUI:showReader(path)`** in `main.lua` is the standard way plugins hand a file to the reader — verify against a recent KOReader checkout if PDFs don't open as expected.
+- **Response header casing** (`Last-Modified-Version`) in `ZoteroClient.lua` is read case-insensitively as a hedge; confirm which casing KOReader's HTTP stack actually normalizes to.
+- **`require("mime").b64`** in `WebDAVClient.lua` (LuaSocket's `mime` module, for the Basic Auth header) is assumed present since KOReader bundles LuaSocket — confirm it resolves on-device.
+- KOReader ships a `webdav.koplugin` for cloud storage that's a closer precedent than `kosync.koplugin` for `WebDAVClient.lua`'s HTTP needs specifically — worth diffing against once you can test on-device.
+- Nothing here has exercised real KOReader event ordering (`onNetworkConnected`, `registerToMainMenu`, etc.) — only Lua syntax was verified (`luaL_loadfile` via a locally-built liblua5.1 checker), not runtime behavior.
+
+## Reference code, licensing
+
+This repo is licensed under **CC BY 4.0**. KOReader's `kosync.koplugin` — used only as a local architectural reference while writing `zotero.koplugin` — is **AGPL-3.0** and is **never committed here**: if you keep a local copy for reference, put it outside the repo or somewhere covered by `.gitignore` (see `CLAUDE.md` §2 for the reasoning).
 
 ## Licencia
 

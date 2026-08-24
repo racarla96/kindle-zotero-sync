@@ -1,0 +1,43 @@
+{
+    "base_url" : "https://api.zotero.org/",
+    "name" : "zotero-web-api",
+    "methods" : {
+        "get_library_version" : {
+            "path" : "/users/:user_id/items",
+            "method" : "GET",
+            "required_params" : [
+                "user_id"
+            ],
+            "optional_params" : [
+                "limit"
+            ],
+            "expected_status" : [200, 403, 404]
+        },
+        "list_items" : {
+            "path" : "/users/:user_id/items",
+            "method" : "GET",
+            "required_params" : [
+                "user_id"
+            ],
+            "optional_params" : [
+                "since",
+                "format",
+                "limit",
+                "start"
+            ],
+            "expected_status" : [200, 403, 404]
+        },
+        "list_collections" : {
+            "path" : "/users/:user_id/collections",
+            "method" : "GET",
+            "required_params" : [
+                "user_id"
+            ],
+            "optional_params" : [
+                "limit",
+                "start"
+            ],
+            "expected_status" : [200, 403, 404]
+        }
+    }
+}
