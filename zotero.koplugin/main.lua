@@ -417,7 +417,23 @@ end
 -- (selected but not yet attempted), waiting for a retry, and already on
 -- the device, in that order. Answers "what's my download queue actually
 -- doing" beyond the bare pending-count the main menu shows.
+--
+-- Wrapped in pcall: this is the newest, least on-device-tested screen in
+-- the plugin (see the NOTE block at the top of this file), and a hard
+-- crash here is worse than a graceful error message while the real
+-- cause is still being tracked down (see CLAUDE.md for the open bug).
 function Zotero:showDownloadsStatus()
+    local ok, err = pcall(function() self:_showDownloadsStatusImpl() end)
+    if not ok then
+        logger.warn("Zotero: showDownloadsStatus failed:", err)
+        UIManager:show(InfoMessage:new{
+            text = _("Couldn't open the downloads view — check koreader.log for details."),
+            timeout = 3,
+        })
+    end
+end
+
+function Zotero:_showDownloadsStatusImpl()
     local item_table = {}
 
     if self.active_download_key then
@@ -434,7 +450,7 @@ function Zotero:showDownloadsStatus()
 
     local queue = ZoteroQueue:load()
     if #queue > 0 then
-        table.insert(item_table, { text = "↻ " .. _("Retry all now"), is_retry_action = true, separator = true })
+        table.insert(item_table, { text = _("Retry all now"), is_retry_action = true })
         for _, entry in ipairs(queue) do
             local cached = LibraryCache:getItem(entry.item_key)
             local label = (cached and cached.title) or entry.item_key
