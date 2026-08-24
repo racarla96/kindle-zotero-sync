@@ -1,0 +1,16 @@
+# Credenciales locales (nunca commitear)
+config/config.json
+
+# Descargas temporales del script de prueba
+scripts/tmp/
+
+# Build artifacts (fases futuras: meson/ninja)
+build/
+*.o
+*.so
+
+# Editores / SO
+.vscode/
+.idea/
+*.swp
+.DS_Store
