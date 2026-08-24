@@ -16,9 +16,9 @@ exists in the library. It's also filtered to formats KOReader can
 actually open (LibraryCache's SUPPORTED_EXTENSIONS) — not just PDF.
 
 WebDAV is entirely optional and off by default: without it (or with the
-"Enable WebDAV PDF downloads" menu toggle left off), metadata sync and
-browsing still work, items can still be marked wanted, but nothing ever
-downloads — see isWebDAVConfigured().
+"Enable WebDAV PDF downloads" checkbox in showCredentialsDialog() left
+unchecked), metadata sync and browsing still work, items can still be
+marked wanted, but nothing ever downloads — see isWebDAVConfigured().
 
 NOTE on things that need on-device verification (no real KOReader install
 was available to test against while writing this):
@@ -30,6 +30,12 @@ was available to test against while writing this):
   - `ReaderUI:showReader(path)` is the standard way plugins hand a file
     off to the reader; double-check the exact call against a recent
     KOReader checkout if it doesn't open PDFs as expected.
+  - showCredentialsDialog() grafts a `CheckButton` onto the
+    `MultiInputDialog` via `dialog:addWidget()` so the WebDAV toggle
+    lives in the same screen as the credential fields. Both APIs are
+    real (verified against KOReader's source), but this specific
+    combination — and whether `parent = dialog` is the right target for
+    the checkbox to trigger a redraw on tap — was never exercised live.
 --]]
 
 local DataStorage = require("datastorage")
@@ -114,22 +120,13 @@ function Zotero:isConfigured()
 end
 
 --- WebDAV fields being filled in isn't enough on its own — downloads only
--- happen once the user has also explicitly flipped the "Enable WebDAV PDF
--- downloads" menu toggle on. Keeps "I don't want this yet" an explicit,
--- persisted choice rather than something inferred from which text fields
--- happen to be non-empty.
+-- happen once the user has also explicitly checked the "Enable WebDAV PDF
+-- downloads" box in showCredentialsDialog(). Keeps "I don't want this
+-- yet" an explicit, persisted choice rather than something inferred from
+-- which text fields happen to be non-empty.
 function Zotero:isWebDAVConfigured()
     return self.settings.webdav_enabled
         and self.settings.webdav_url and self.settings.webdav_url ~= ""
-        and self.settings.webdav_user and self.settings.webdav_user ~= ""
-        and self.settings.webdav_password and self.settings.webdav_password ~= ""
-end
-
---- Are the WebDAV text fields filled in (regardless of the enable
--- toggle)? Used to gate the toggle itself: no point letting the user
--- flip "on" before there's anything to connect to.
-function Zotero:hasWebDAVFields()
-    return self.settings.webdav_url and self.settings.webdav_url ~= ""
         and self.settings.webdav_user and self.settings.webdav_user ~= ""
         and self.settings.webdav_password and self.settings.webdav_password ~= ""
 end
@@ -153,17 +150,6 @@ function Zotero:addToMainMenu(menu_items)
                 text = _("Configure credentials"),
                 keep_menu_open = true,
                 callback = function() self:showCredentialsDialog() end,
-            },
-            {
-                text = _("Enable WebDAV PDF downloads"),
-                checked_func = function() return self.settings.webdav_enabled end,
-                enabled_func = function() return self:hasWebDAVFields() end,
-                help_text = _("Off by default. Fill in the WebDAV fields under \"Configure credentials\" first, then enable this — without it, sync still updates metadata and lets you select items, but nothing ever downloads."),
-                keep_menu_open = true,
-                callback = function()
-                    self.settings.webdav_enabled = not self.settings.webdav_enabled
-                    self.updated = true
-                end,
                 separator = true,
             },
             {
@@ -183,8 +169,19 @@ function Zotero:addToMainMenu(menu_items)
     }
 end
 
+--- Credentials + the WebDAV enable toggle, in one screen. MultiInputDialog
+-- itself only does text fields — the checkbox is a separate CheckButton
+-- widget grafted on via MultiInputDialog:addWidget() (both are real
+-- KOReader APIs, verified against source, but this specific combination
+-- wasn't exercised on a live device — see the NOTE at the top of this
+-- file). `checkbox` is forward-declared like `dialog` so the Save
+-- button's closure (defined before the checkbox exists) can still read
+-- its final `.checked` state once the user actually taps Save.
 function Zotero:showCredentialsDialog()
+    local CheckButton = require("ui/widget/checkbutton")
     local dialog
+    local checkbox
+
     dialog = MultiInputDialog:new{
         title = _("Zotero credentials"),
         fields = {
@@ -218,6 +215,11 @@ function Zotero:showCredentialsDialog()
                         -- Don't trim the password: leading/trailing spaces
                         -- could be intentional (unlikely, but not our call).
                         self.settings.webdav_password = (webdav_password ~= "" and webdav_password) or nil
+                        -- isWebDAVConfigured() still requires the three
+                        -- WebDAV fields above regardless of this flag, so
+                        -- checking the box with empty fields is harmless
+                        -- (downloads just won't run until both are true).
+                        self.settings.webdav_enabled = checkbox and checkbox.checked or false
                         self.updated = true
                         UIManager:close(dialog)
                         UIManager:show(InfoMessage:new{
@@ -229,6 +231,15 @@ function Zotero:showCredentialsDialog()
             },
         },
     }
+
+    checkbox = CheckButton:new{
+        text = _("Enable WebDAV PDF downloads (needs the WebDAV fields above filled in)"),
+        checked = self.settings.webdav_enabled,
+        parent = dialog,
+        callback = function() end, -- state is just read from checkbox.checked on Save
+    }
+    dialog:addWidget(checkbox)
+
     UIManager:show(dialog)
     dialog:onShowKeyboard()
 end
@@ -292,7 +303,7 @@ function Zotero:sync(interactive)
                     if not self:isWebDAVConfigured() then
                         local pending = #LibraryCache:getPendingAttachments()
                         extra = pending > 0
-                            and T(_(" (%1 selected item(s) need WebDAV enabled to download — see \"Enable WebDAV PDF downloads\")"), pending)
+                            and T(_(" (%1 selected item(s) need WebDAV enabled to download — see \"Configure credentials\")"), pending)
                             or ""
                     else
                         extra = failed > 0 and T(_(", %1 queued for retry"), failed) or ""
